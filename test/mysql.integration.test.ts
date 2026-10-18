@@ -300,3 +300,34 @@ describe.skipIf(!url)("mysql review fixes round 2 (live)", () => {
     }
   });
 });
+
+describe.skipIf(!url)("mysql review fixes round 3 (live)", () => {
+  const guarded = url
+    ? ctxFor("read_write", { MYSQL_SCHEMAS: "shop", MYSQL_HIDDEN_COLUMNS: "api_token" })
+    : (undefined as never);
+
+  it("INSERT … () VALUES () counts as positional", async () => {
+    await expect(
+      dispatchTool("sql_execute", { sql: "INSERT INTO customers () VALUES ()", dry_run: true }, guarded),
+    ).rejects.toThrow(/list the columns/);
+  });
+
+  it("views over forbidden schemas or hidden columns are refused", async () => {
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE OR REPLACE VIEW shop.vault_view AS SELECT secret FROM secret.vault");
+    await root.query("CREATE OR REPLACE VIEW shop.token_view AS SELECT api_token AS t FROM shop.customers");
+    try {
+      await expect(dispatchTool("sql_query", { sql: "SELECT * FROM vault_view" }, guarded)).rejects.toThrow(
+        /secret.vault/,
+      );
+      await expect(dispatchTool("sql_query", { sql: "SELECT t FROM token_view" }, guarded)).rejects.toThrow(
+        /hidden/,
+      );
+      const ok = (await dispatchTool("sql_query", { sql: "SELECT email FROM order_totals" }, guarded)) as any;
+      expect(ok.row_count).toBeGreaterThan(0);
+    } finally {
+      await root.query("DROP VIEW shop.vault_view, shop.token_view");
+      await root.end();
+    }
+  });
+});

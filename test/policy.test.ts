@@ -126,8 +126,14 @@ describe("limitRows", () => {
     expect(stats.rowsDropped).toBe(50 - out.length);
     expect(JSON.stringify(out).length).toBeLessThanOrEqual(2_000);
   });
-  it("always keeps at least one row", () => {
-    expect(limitRows([{ a: "z".repeat(5000) }], 1_000, 10_000).rows).toHaveLength(1);
+  it("shrinks an oversized first row to fit, or drops it", () => {
+    const one = limitRows([{ a: "z".repeat(5000) }], 1_000, 10_000);
+    expect(one.rows).toHaveLength(1);
+    expect(JSON.stringify(one.rows).length).toBeLessThanOrEqual(1_000);
+    const wide = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`column_${i}`, i]));
+    const dropped = limitRows([wide], 1_000, 2_000);
+    expect(dropped.rows).toHaveLength(0);
+    expect(dropped.stats.rowsDropped).toBe(1);
   });
 });
 

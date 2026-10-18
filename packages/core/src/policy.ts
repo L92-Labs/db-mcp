@@ -130,8 +130,12 @@ export function positionalInsertTarget(tokens: Token[]): { schema?: string; tabl
   // Alias (Postgres `INSERT INTO t AS x (…)`) before the column list
   if (isWord(next, "AS")) i += 2;
   const after = tokens[i];
+  // `()` is MySQL's "all defaults" form: still writes every column.
   const hasColumnList =
-    isPunct(after, "(") && !isWord(tokens[i + 1], "SELECT") && !isWord(tokens[i + 1], "WITH");
+    isPunct(after, "(") &&
+    !isWord(tokens[i + 1], "SELECT") &&
+    !isWord(tokens[i + 1], "WITH") &&
+    !isPunct(tokens[i + 1], ")");
   if (hasColumnList || isWord(after, "SET")) return null;
   return target;
 }

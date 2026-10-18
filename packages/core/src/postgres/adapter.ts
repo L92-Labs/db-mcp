@@ -99,32 +99,48 @@ type CursorRead = {
   command?: string;
 };
 
+/**
+ * Read through a cursor, keeping at most `limit` rows. `drain` reads the portal to the end
+ * (discarding extra rows) so writes report their CommandComplete row count.
+ */
 function readCursor(
   client: pg.ClientBase,
   text: string,
   values: unknown[],
   limit: number,
+  drain = false,
 ): Promise<CursorRead> {
   const cursor = client.query(new Cursor(text, values, { types: pgTypes }));
+  const batch = drain ? Math.max(limit, 500) : limit;
+  const kept: Record<string, unknown>[] = [];
   return new Promise((resolve, reject) => {
-    cursor.read(limit, (err, rows, result) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      cursor.close((closeErr) => {
-        if (closeErr) {
-          reject(closeErr);
+    const step = () => {
+      cursor.read(batch, (err, rows, result) => {
+        if (err) {
+          reject(err);
           return;
         }
-        resolve({
-          rows: rows as Record<string, unknown>[],
-          fields: result?.fields ?? [],
-          rowCount: result?.rowCount ?? null,
-          command: result?.command || undefined,
+        for (const r of rows as Record<string, unknown>[]) if (kept.length < limit) kept.push(r);
+        const finished = rows.length < batch;
+        if (drain && !finished) {
+          step();
+          return;
+        }
+        cursor.close((closeErr) => {
+          if (closeErr) {
+            reject(closeErr);
+            return;
+          }
+          resolve({
+            rows: kept,
+            fields: result?.fields ?? [],
+            rowCount: result?.rowCount ?? null,
+            command: result?.command || undefined,
+          });
         });
       });
-    });
+    };
+    step();
   });
 }
 
@@ -541,7 +557,14 @@ export function createPostgresAdapter(
         // One statement (extended protocol), committed atomically (or rolled back for dry runs).
         return inTransaction(input.dryRun ? "dry_run" : "write", input.timeoutMs, async (client) => {
           await enforcePolicy(client, input.sql, values);
-          const res = await readCursor(client, input.sql, values, input.maxRows + 1);
+          // Writes drain the portal: the affected-row count only arrives once it completes.
+          const res = await readCursor(
+            client,
+            input.sql,
+            values,
+            input.maxRows + 1,
+            input.classified === "write",
+          );
           const columns = await columnMeta(client, res.fields);
           return shape(res.rows, columns, input.maxRows, input.classified, {
             command: res.command,

@@ -1,8 +1,8 @@
 import mysql from "mysql2/promise";
 import type { ConnectionOptions, FieldPacket, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { likePattern, toJsonValue } from "../format.js";
-import { columnHidden, policyFor, schemaAllowed } from "../policy.js";
-import { classAllowed, qualifierTokens, splitStatements } from "../sql/classify.js";
+import { columnHidden, mentionsHidden, policyFor, schemaAllowed } from "../policy.js";
+import { classAllowed, identifierTokens, qualifierTokens, splitStatements } from "../sql/classify.js";
 import type {
   ColumnMeta,
   DbAdapter,
@@ -262,7 +262,9 @@ export function createMySqlAdapter(
 
   /** Before running: default database and every schema-qualified name must be allowed. */
   async function enforceSql(client: MySqlClient, sql: string): Promise<void> {
-    if (!policy?.schemas) return;
+    if (!policy) return;
+    await enforceViews(client, sql);
+    if (!policy.schemas) return;
     const [[row]] = await q<RowDataPacket[]>(client, "SELECT DATABASE() AS db");
     const current = row?.db as string | null;
     if (current && !schemaAllowed(policy, current)) {
@@ -275,6 +277,73 @@ export function createMySqlAdapter(
       if (known.has(qualifier.toLowerCase()) && !schemaAllowed(policy, qualifier)) {
         throw new Error(`schema ${qualifier} is outside the allowlist of connection "${connection.name}"`);
       }
+    }
+  }
+
+  /**
+   * Result metadata names a view, not its base tables, so check every view the SQL names:
+   * its base tables (recursively) must be allowed and its definition must not read hidden columns.
+   */
+  async function enforceViews(client: MySqlClient, sql: string): Promise<void> {
+    if (!policy) return;
+    const names = [
+      ...new Set(
+        splitStatements(sql, "mysql")
+          .flatMap(identifierTokens)
+          .map((n) => n.toLowerCase()),
+      ),
+    ];
+    if (names.length === 0) return;
+    let views = await metaQuery<{ schema: string; name: string; definition: string }>(
+      client,
+      `SELECT TABLE_SCHEMA AS \`schema\`, TABLE_NAME AS name, VIEW_DEFINITION AS definition
+       FROM information_schema.VIEWS WHERE LOWER(TABLE_NAME) IN (?)`,
+      [names],
+    );
+    const seen = new Set<string>();
+    for (let depth = 0; views.length > 0 && depth < 10; depth++) {
+      const next: typeof views = [];
+      for (const v of views) {
+        const key = `${v.schema}.${v.name}`.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (mentionsHidden(policy, v.definition ?? "")) {
+          throw new Error(
+            `view ${v.schema}.${v.name} reads a hidden column on connection "${connection.name}"`,
+          );
+        }
+        let usage: Array<{ schema: string; name: string }>;
+        try {
+          usage = await metaQuery(
+            client,
+            `SELECT TABLE_SCHEMA AS \`schema\`, TABLE_NAME AS name FROM information_schema.VIEW_TABLE_USAGE
+             WHERE VIEW_SCHEMA = ? AND VIEW_NAME = ?`,
+            [v.schema, v.name],
+          );
+        } catch {
+          throw new Error(
+            `views cannot be checked on this server (no VIEW_TABLE_USAGE); ${v.schema}.${v.name} is refused on connection "${connection.name}"`,
+          );
+        }
+        for (const u of usage) {
+          if (!schemaAllowed(policy, u.schema)) {
+            throw new Error(
+              `view ${v.schema}.${v.name} reads ${u.schema}.${u.name}, outside the allowlist of connection "${connection.name}"`,
+            );
+          }
+        }
+        if (usage.length > 0) {
+          next.push(
+            ...(await metaQuery<{ schema: string; name: string; definition: string }>(
+              client,
+              `SELECT TABLE_SCHEMA AS \`schema\`, TABLE_NAME AS name, VIEW_DEFINITION AS definition
+               FROM information_schema.VIEWS WHERE (TABLE_SCHEMA, TABLE_NAME) IN (?)`,
+              [usage.map((u) => [u.schema, u.name])],
+            )),
+          );
+        }
+      }
+      views = next;
     }
   }
 

@@ -64,30 +64,40 @@ export function limitRows(
   maxCellChars: number,
 ): { rows: Record<string, unknown>[]; stats: LimitStats } {
   const stats: LimitStats = { cellsTruncated: 0, rowsDropped: 0 };
-  const cut = (v: unknown): unknown => {
-    if (typeof v === "string") {
-      if (v.length <= maxCellChars) return v;
-      stats.cellsTruncated++;
-      return `${v.slice(0, maxCellChars)}…[+${v.length - maxCellChars} chars]`;
+  const cut = (v: unknown, limit: number): [unknown, boolean] => {
+    const text = typeof v === "string" ? v : v !== null && typeof v === "object" ? JSON.stringify(v) : null;
+    if (text === null || text.length <= limit) return [v, false];
+    return [`${text.slice(0, limit)}…[+${text.length - limit} chars]`, true];
+  };
+  const shrink = (row: Record<string, unknown>, limit: number) => {
+    const next: Record<string, unknown> = {};
+    let cells = 0;
+    for (const [k, v] of Object.entries(row)) {
+      const [value, changed] = cut(v, limit);
+      next[k] = value;
+      if (changed) cells++;
     }
-    if (v !== null && typeof v === "object") {
-      const json = JSON.stringify(v);
-      if (json.length <= maxCellChars) return v;
-      stats.cellsTruncated++;
-      return `${json.slice(0, maxCellChars)}…[+${json.length - maxCellChars} chars]`;
-    }
-    return v;
+    return { next, cells, bytes: new TextEncoder().encode(JSON.stringify(next)).length + 1 };
   };
   const out: Record<string, unknown>[] = [];
   let size = 2;
   for (const row of rows) {
-    const next: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(row)) next[k] = cut(v);
-    const bytes = new TextEncoder().encode(JSON.stringify(next)).length + 1;
-    if (size + bytes > maxBytes && out.length > 0) {
+    let { next, cells, bytes } = shrink(row, maxCellChars);
+    if (out.length === 0) {
+      // The first row must fit too: cut its cells harder before giving up on it.
+      for (
+        let limit = Math.floor(maxCellChars / 2);
+        size + bytes > maxBytes && limit >= 16;
+        limit = Math.floor(limit / 2)
+      ) {
+        ({ next, cells, bytes } = shrink(row, limit));
+      }
+    }
+    if (size + bytes > maxBytes) {
       stats.rowsDropped = rows.length - out.length;
       break;
     }
+    stats.cellsTruncated += cells;
     size += bytes;
     out.push(next);
   }

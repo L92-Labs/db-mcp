@@ -379,3 +379,15 @@ describe.skipIf(!url)("postgres review fixes round 2 (live)", () => {
     expect(r.rows[0].label).toBe("api_token");
   });
 });
+
+describe.skipIf(!url)("postgres review fixes round 3 (live)", () => {
+  it("dry-run DML with RETURNING beyond max_rows still reports affected rows", async () => {
+    const rw = ctxFor("read_write", { DB_MAX_ROWS: "1" });
+    const r = (await dispatchTool(
+      "sql_execute",
+      { sql: "UPDATE shop.orders SET status = status RETURNING id", dry_run: true },
+      rw,
+    )) as any;
+    expect(r).toMatchObject({ affected_rows: 3, row_count: 1, truncated: true, rolled_back: true });
+  });
+});
