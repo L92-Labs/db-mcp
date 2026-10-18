@@ -3,6 +3,9 @@ import {
   bqRowsToObjects,
   clearTokenCache,
   createBigQueryAdapter,
+  createDispatchContext,
+  dispatchTool,
+  loadRuntimeConfig,
   serviceAccountTokenProvider,
   signServiceAccountJwt,
   toQueryParameters,
@@ -301,5 +304,51 @@ describe("BigQuery policy and dry run", () => {
     expect(r.columns).toEqual([{ name: "id", type: "INT64" }]);
     expect(calls.find((c) => c.url.includes("/users/data?"))!.url).toContain("selectedFields=id");
     await expect(a.sampleTable({ schema: "hr", table: "users" }, 5, 1000)).rejects.toThrow(/allowlist/);
+  });
+});
+
+describe("BigQuery positional DML under hidden columns", () => {
+  it("refuses INSERT … VALUES and MERGE … INSERT ROW into a table with hidden columns", async () => {
+    const calls: Call[] = [];
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ method: init?.method ?? "GET", url });
+      if (url.endsWith("/tables/users")) {
+        return new Response(
+          JSON.stringify({
+            type: "TABLE",
+            schema: {
+              fields: [
+                { name: "id", type: "INT64" },
+                { name: "email", type: "STRING" },
+              ],
+            },
+          }),
+        );
+      }
+      return new Response(JSON.stringify({ statistics: { query: { statementType: "INSERT" } } }));
+    }) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "proj",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_ACCESS: "read_write",
+      BIGQUERY_HIDDEN_COLUMNS: "email",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    await expect(
+      dispatchTool("sql_execute", { sql: "INSERT INTO analytics.users VALUES (1, 'a@b.c')" }, ctx),
+    ).rejects.toThrow(/list the columns/);
+    await expect(
+      dispatchTool(
+        "sql_execute",
+        {
+          sql: "MERGE analytics.users t USING analytics.staging s ON t.id = s.id WHEN NOT MATCHED THEN INSERT ROW",
+        },
+        ctx,
+      ),
+    ).rejects.toThrow(/list the columns/);
+    expect(calls.some((c) => c.url.endsWith("/queries"))).toBe(false);
   });
 });

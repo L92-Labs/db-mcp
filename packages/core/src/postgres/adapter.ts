@@ -449,8 +449,9 @@ export function createPostgresAdapter(
         );
         const referencedBy = await metaQuery(
           client,
-          `SELECT conrelid::regclass::text AS table, conname AS name, pg_get_constraintdef(oid, true) AS definition
-          FROM pg_constraint WHERE confrelid = $1 AND contype = 'f' ORDER BY 1, 2`,
+          `SELECT n.nspname || '.' || c.relname AS table, k.conname AS name, pg_get_constraintdef(k.oid, true) AS definition
+          FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE k.confrelid = $1 AND k.contype = 'f' ORDER BY 1, 2`,
           [rel.oid],
         );
         const view =

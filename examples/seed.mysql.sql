@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS customers (
   email      VARCHAR(255) NOT NULL UNIQUE,
   name       VARCHAR(255),
   api_token  VARCHAR(255),
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX customers_token_idx (api_token)
 ) COMMENT = 'People who bought something';
 
 CREATE TABLE IF NOT EXISTS orders (

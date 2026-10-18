@@ -304,3 +304,43 @@ describe.skipIf(!url)("postgres dry run, policy, budget (live)", () => {
     expect(r.row_count).toBeLessThan(100);
   });
 });
+
+describe.skipIf(!url)("postgres review fixes (live)", () => {
+  const guarded = url
+    ? ctxFor("read_write", { DATABASE_SCHEMAS: "shop", DATABASE_HIDDEN_COLUMNS: "customers.api_token" })
+    : (undefined as never);
+
+  it("columns_search fills its limit from allowed schemas only", async () => {
+    const r = (await dispatchTool("columns_search", { pattern: "id", limit: 2 }, guarded)) as any;
+    expect(r.count).toBe(2);
+    expect(r.columns.every((c: any) => c.schema === "shop")).toBe(true);
+  });
+
+  it("describe redacts indexes on hidden columns and keeps the rest", async () => {
+    const d = (await dispatchTool("table_describe", { table: "shop.customers" }, guarded)) as any;
+    expect(d.indexes.map((i: any) => i.name)).not.toContain("customers_token_idx");
+    expect(d.indexes.map((i: any) => i.name)).toContain("customers_pkey");
+    expect(d.referenced_by[0].table).toBe("shop.orders");
+  });
+
+  it("positional INSERT into a table with hidden columns is refused", async () => {
+    await expect(
+      dispatchTool(
+        "sql_execute",
+        { sql: "INSERT INTO shop.customers VALUES (99, 'x@y.z', 'X', 'tok', now())" },
+        guarded,
+      ),
+    ).rejects.toThrow(/list the columns/);
+    const ok = (await dispatchTool(
+      "sql_execute",
+      { sql: "INSERT INTO shop.customers (email) VALUES ('ok@y.z')", dry_run: true },
+      guarded,
+    )) as any;
+    expect(ok.affected_rows).toBe(1);
+  });
+
+  it("a scoped rule leaves same-named columns on other tables usable", async () => {
+    const r = (await dispatchTool("sql_query", { sql: "SELECT 'x' AS api_token" }, guarded)) as any;
+    expect(r.rows).toEqual([{ api_token: "x" }]);
+  });
+});

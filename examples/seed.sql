@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS shop.customers (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE shop.customers IS 'People who bought something';
+CREATE INDEX IF NOT EXISTS customers_token_idx ON shop.customers (api_token);
 
 CREATE TABLE IF NOT EXISTS shop.orders (
   id          bigserial PRIMARY KEY,

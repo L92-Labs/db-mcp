@@ -8,6 +8,7 @@ import {
   pgClientConfig,
   type AdapterFactory,
   type ConnectionConfig,
+  type MySqlClient,
 } from "@db-mcp/core";
 import { isHyperdrive, type WorkerEnv } from "./env.js";
 
@@ -38,7 +39,8 @@ export function workerAdapterFactory(env: WorkerEnv): AdapterFactory {
       return createMySqlAdapter(connection, {
         async connect() {
           const conn = await mysql.createConnection(options);
-          return { client: conn, release: () => conn.end().catch(() => undefined) };
+          // mysql2/promise exposes the callback connection at runtime; its typings omit it.
+          return { client: conn as unknown as MySqlClient, release: () => conn.end().catch(() => undefined) };
         },
       });
     }

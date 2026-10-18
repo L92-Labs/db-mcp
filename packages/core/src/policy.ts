@@ -1,4 +1,4 @@
-import { identifierTokens, splitStatements, type StatementInfo } from "./sql/classify.js";
+import { identifierTokens, splitStatements, type StatementInfo, type Token } from "./sql/classify.js";
 import type { ConnectionConfig, Engine } from "./types.js";
 
 /**
@@ -15,6 +15,7 @@ import type { ConnectionConfig, Engine } from "./types.js";
 type Rule = { schema?: RegExp; table?: RegExp; column: RegExp; source: string };
 
 export type Policy = {
+  engine: Engine;
   schemas: string[] | null;
   rules: Rule[];
 };
@@ -44,16 +45,21 @@ export function policyFor(connection: ConnectionConfig): Policy | null {
   const schemas = connection.schemas?.length ? connection.schemas : null;
   const rules = (connection.hiddenColumns ?? []).map(parseRule);
   if (!schemas && rules.length === 0) return null;
-  return { schemas, rules };
+  return { engine: connection.engine, schemas, rules };
 }
 
+/**
+ * Engine semantics: Postgres schema names are exact (quoted "SHOP" ≠ shop); MySQL compares
+ * case-insensitively; BigQuery datasets may be written "dataset" or "project.dataset".
+ */
 export function schemaAllowed(policy: Policy | null, schema: string | null | undefined): boolean {
   if (!policy?.schemas || schema === null || schema === undefined) return true;
-  const s = schema.toLowerCase();
-  // BigQuery: "project.dataset" or "dataset" both match a "dataset" / "project.dataset" entry
+  if (policy.engine === "postgres") return policy.schemas.includes(schema);
+  if (policy.engine === "mysql") return policy.schemas.some((a) => a.toLowerCase() === schema.toLowerCase());
+  const dataset = (name: string) => name.split(".").pop()!;
   return policy.schemas.some((allowed) => {
-    const a = allowed.toLowerCase();
-    return a === s || s.endsWith(`.${a}`) || a.endsWith(`.${s}`);
+    if (allowed.includes(".") && schema.includes(".")) return allowed === schema;
+    return dataset(allowed) === dataset(schema);
   });
 }
 
@@ -74,6 +80,107 @@ export function describePolicy(policy: Policy | null) {
   return policy ? { schemas: policy.schemas, hidden_columns: policy.rules.map((r) => r.source) } : null;
 }
 
+/**
+ * Does `text` (an index definition, view SQL…) mention a hidden column? Scoped rules
+ * (`table.column`) only count when their table name appears too.
+ */
+export function mentionsHidden(policy: Policy | null, text: string, table?: string): boolean {
+  if (!policy || policy.rules.length === 0) return false;
+  const words = text.match(/[A-Za-z_][A-Za-z0-9_$]*/g) ?? [];
+  return policy.rules.some(
+    (r) =>
+      words.some((w) => r.column.test(w)) &&
+      (!r.table || (table !== undefined && r.table.test(table)) || words.some((w) => r.table!.test(w))),
+  );
+}
+
+function isPunct(t: Token | undefined, value: string): boolean {
+  return t?.kind === "punct" && t.value === value;
+}
+
+function isWord(t: Token | undefined, value?: string): boolean {
+  return t?.kind === "word" && (value === undefined || t.value === value);
+}
+
+/** `*` used as a select-list projection (`SELECT *`, `t.*`, `, *`) rather than multiplication or COUNT(*). */
+export function hasStarProjection(tokens: Token[]): boolean {
+  return tokens.some((t, i) => {
+    if (!isPunct(t, "*")) return false;
+    const prev = tokens[i - 1];
+    const next = tokens[i + 1];
+    const afterSelect = isWord(prev, "SELECT") || isWord(prev, "DISTINCT") || isWord(prev, "ALL");
+    const qualified = isPunct(prev, ".");
+    const listed = isPunct(prev, ",") && (isWord(next, "FROM") || isPunct(next, ","));
+    return afterSelect || qualified || listed;
+  });
+}
+
+/** Target of `INSERT/REPLACE [INTO] t VALUES|SELECT …` without a column list, if any. */
+export function positionalInsertTarget(tokens: Token[]): { schema?: string; table: string } | null {
+  if (isWord(tokens[0], "MERGE")) return null; // see positionalMergeTarget
+  const start = tokens.findIndex((t) => isWord(t, "INSERT") || isWord(t, "REPLACE"));
+  if (start === -1) return null;
+  let i = start + 1;
+  const skip = new Set(["INTO", "IGNORE", "LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "OVERWRITE", "TABLE"]);
+  while (isWord(tokens[i]) && skip.has((tokens[i] as { value: string }).value)) i++;
+  const target = targetAfter(tokens, i);
+  if (!target) return null;
+  i = targetEnd(tokens, i);
+  const next = tokens[i];
+  // Alias (Postgres `INSERT INTO t AS x (…)`) before the column list
+  if (isWord(next, "AS")) i += 2;
+  const after = tokens[i];
+  const hasColumnList =
+    isPunct(after, "(") && !isWord(tokens[i + 1], "SELECT") && !isWord(tokens[i + 1], "WITH");
+  if (hasColumnList || isWord(after, "SET")) return null;
+  return target;
+}
+
+/** `MERGE [INTO] t … INSERT ROW | INSERT VALUES (…)` writes every column positionally. */
+export function positionalMergeTarget(tokens: Token[]): { schema?: string; table: string } | null {
+  if (!isWord(tokens[0], "MERGE")) return null;
+  const positional = tokens.some(
+    (t, i) => isWord(t, "INSERT") && (isWord(tokens[i + 1], "ROW") || isWord(tokens[i + 1], "VALUES")),
+  );
+  if (!positional) return null;
+  return targetAfter(tokens, 1);
+}
+
+/** Index just past a dotted name starting at `from`. */
+function targetEnd(tokens: Token[], from: number): number {
+  let i = from;
+  for (;;) {
+    const t = tokens[i];
+    if (t?.kind !== "ident" && t?.kind !== "word") return i;
+    i++;
+    if (!isPunct(tokens[i], ".")) return i;
+    i++;
+  }
+}
+
+/** Dotted name (`a.b.c`, `` `p.d.t` ``) starting at `from`, skipping a leading INTO. */
+function targetAfter(tokens: Token[], from: number): { schema?: string; table: string } | null {
+  let i = from;
+  if (isWord(tokens[i], "INTO")) i++;
+  const parts: string[] = [];
+  for (;;) {
+    const t = tokens[i];
+    if (t?.kind === "ident") parts.push(...t.value.split("."));
+    else if (t?.kind === "word") parts.push(t.raw);
+    else break;
+    i++;
+    if (!isPunct(tokens[i], ".")) break;
+    i++;
+  }
+  if (parts.length === 0) return null;
+  return {
+    schema: parts.length > 1 ? parts.slice(0, -1).join(".") : undefined,
+    table: parts[parts.length - 1]!,
+  };
+}
+
+const MYSQL_METADATA_KEYWORDS = new Set(["SHOW", "DESCRIBE", "DESC", "EXPLAIN"]);
+
 /** Engine-agnostic SQL checks: admin statements, hidden column names, catalog access. */
 export function assertSqlPolicy(
   sql: string,
@@ -91,10 +198,19 @@ export function assertSqlPolicy(
   if (engine === "postgres" && statements.some((s) => s.keyword === "EXPLAIN")) {
     throw new Error("use sql_explain instead of EXPLAIN on a connection with a schema/column policy");
   }
-  const idents = splitStatements(sql, engine).flatMap(identifierTokens);
+  if (engine === "mysql" && statements.some((s) => MYSQL_METADATA_KEYWORDS.has(s.keyword))) {
+    throw new Error(
+      `${statements[0]!.keyword} is disabled on connection "${connection}" (schema/column policy); use schemas_list, tables_list, table_describe or sql_explain`,
+    );
+  }
+  const tokens = splitStatements(sql, engine);
+  const idents = tokens.flatMap(identifierTokens);
   for (const id of idents) {
-    if (policy.rules.some((r) => r.column.test(id))) {
-      throw new Error(`"${id}" matches a hidden column pattern on connection "${connection}"`);
+    const rule = policy.rules.find(
+      (r) => r.column.test(id) && (!r.table || idents.some((other) => r.table!.test(other))),
+    );
+    if (rule) {
+      throw new Error(`"${id}" matches hidden column pattern "${rule.source}" on connection "${connection}"`);
     }
     if (policy.schemas && engine !== "postgres") {
       const u = id.toUpperCase();
@@ -102,5 +218,17 @@ export function assertSqlPolicy(
         throw new Error(`${id} is outside the schema allowlist of connection "${connection}"`);
       }
     }
+  }
+  // Writes return no result columns to check, so `INSERT … SELECT *` could copy hidden data out.
+  // (Postgres inspects the real plan instead.)
+  if (
+    policy.rules.length > 0 &&
+    engine !== "postgres" &&
+    statements.some((s) => s.class === "write") &&
+    tokens.some(hasStarProjection)
+  ) {
+    throw new Error(
+      `list columns explicitly: SELECT * inside a write is refused on connection "${connection}" (hidden columns)`,
+    );
   }
 }

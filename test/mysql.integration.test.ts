@@ -206,3 +206,76 @@ describe.skipIf(!url)("mysql adapter (live)", () => {
     expect(e.plan.query_block).toBeDefined();
   });
 });
+
+describe.skipIf(!url)("mysql review fixes (live)", () => {
+  const ro = url ? ctxFor("read_only") : (undefined as never);
+  const guarded = url
+    ? ctxFor("read_write", { MYSQL_SCHEMAS: "shop", MYSQL_HIDDEN_COLUMNS: "api_token" })
+    : (undefined as never);
+
+  it("an explicit huge LIMIT is still capped client-side and the pool recovers", async () => {
+    const started = Date.now();
+    const r = (await dispatchTool(
+      "sql_query",
+      {
+        sql: "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 900) SELECT a.i, b.i AS j FROM n a CROSS JOIN n b LIMIT 100000000",
+        max_rows: 5,
+      },
+      ro,
+    )) as any;
+    expect(r).toMatchObject({ row_count: 5, truncated: true });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    const again = (await dispatchTool("sql_query", { sql: "SELECT 1 AS one" }, ro)) as any;
+    expect(again.rows).toEqual([{ one: "1" }]); // integer literals are BIGINT → string
+  });
+
+  it("ANSI_QUOTES on the server cannot smuggle a qualified name past the allowlist", async () => {
+    const root = await mysql.createConnection(url!);
+    const [[{ mode }]] = (await root.query("SELECT @@GLOBAL.sql_mode AS mode")) as any;
+    await root.query("SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ANSI_QUOTES')");
+    try {
+      const fresh = ctxFor("read_write", { MYSQL_SCHEMAS: "shop" });
+      await expect(
+        dispatchTool("sql_execute", { sql: 'DELETE FROM "secret"."vault"' }, fresh),
+      ).rejects.toThrow();
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM secret.vault")) as any;
+      expect(Number(n)).toBe(1);
+    } finally {
+      await root.query("SET GLOBAL sql_mode = ?", [mode]);
+      await root.end();
+    }
+  });
+
+  it("positional writes into a table with hidden columns are refused", async () => {
+    await expect(
+      dispatchTool(
+        "sql_execute",
+        { sql: "INSERT INTO customers VALUES (99, 'x@y.z', 'X', 'tok', NOW())" },
+        guarded,
+      ),
+    ).rejects.toThrow(/list the columns/);
+    await expect(
+      dispatchTool(
+        "sql_execute",
+        {
+          sql: "INSERT INTO orders (customer_id, total_cents, placed_on) SELECT * FROM customers",
+          dry_run: true,
+        },
+        guarded,
+      ),
+    ).rejects.toThrow(/SELECT \*/);
+    const ok = (await dispatchTool(
+      "sql_execute",
+      { sql: "INSERT INTO customers (email, name) VALUES ('ok@y.z', 'Ok')", dry_run: true },
+      guarded,
+    )) as any;
+    expect(ok.affected_rows).toBe(1);
+  });
+
+  it("describe hides indexes on hidden columns; metadata statements are refused", async () => {
+    const d = (await dispatchTool("table_describe", { table: "customers" }, guarded)) as any;
+    expect(d.indexes.map((i: any) => i.name)).not.toContain("customers_token_idx");
+    expect(d.redacted_items).toBeGreaterThan(0);
+    await expect(dispatchTool("sql_query", { sql: "SHOW DATABASES" }, guarded)).rejects.toThrow(/disabled/);
+  });
+});

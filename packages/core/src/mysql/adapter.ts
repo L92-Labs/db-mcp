@@ -14,8 +14,21 @@ import type {
 } from "../types.js";
 
 /** The subset of a mysql2/promise connection the adapter uses (Connection and PoolConnection both fit). */
+/** Event-emitting query of the underlying (non-promise) mysql2 connection, used to stream rows. */
+type CoreQuery = {
+  on(event: "fields", cb: (fields: FieldPacket[]) => void): CoreQuery;
+  on(event: "result", cb: (row: unknown) => void): CoreQuery;
+  on(event: "error", cb: (error: Error) => void): CoreQuery;
+  on(event: "end", cb: () => void): CoreQuery;
+};
+
 export type MySqlClient = {
   query(options: { sql: string; values?: unknown[]; timeout?: number }): Promise<[unknown, FieldPacket[]]>;
+  /** mysql2/promise exposes the callback connection here (Connection and PoolConnection). */
+  connection: {
+    query(options: { sql: string; values?: unknown[]; timeout?: number }): unknown;
+    destroy(): void;
+  };
 };
 
 export type MySqlLease = {
@@ -83,11 +96,13 @@ export function createMySqlAdapter(
   let timeoutVar: "max_execution_time" | "max_statement_time" | null | undefined;
   let knownSchemas: Set<string> | undefined;
 
-  async function withClient<T>(fn: (client: MySqlClient) => Promise<T>): Promise<T> {
+  async function withClient<T>(fn: (client: MySqlClient, discard: () => void) => Promise<T>): Promise<T> {
     const lease = await opts.connect();
     let broken: Error | undefined;
     try {
-      return await fn(lease.client);
+      return await fn(lease.client, () => {
+        broken = new Error("connection discarded after a truncated result");
+      });
     } catch (error) {
       broken = error instanceof Error ? error : new Error(String(error));
       throw error;
@@ -126,6 +141,79 @@ export function createMySqlAdapter(
   }
 
   /**
+   * The lexer assumes MySQL's default quoting: "…" is a string and backslashes escape.
+   * Strip ANSI_QUOTES / NO_BACKSLASH_ESCAPES so the server parses SQL the way we checked it.
+   */
+  async function pinSqlMode(client: MySqlClient): Promise<void> {
+    const [[row]] = await q<RowDataPacket[]>(client, "SELECT @@SESSION.sql_mode AS mode");
+    const modes = String(row?.mode ?? "")
+      .split(",")
+      .filter(Boolean);
+    const kept = modes.filter((m) => m !== "ANSI_QUOTES" && m !== "NO_BACKSLASH_ESCAPES" && m !== "ANSI");
+    if (kept.length !== modes.length) await q(client, "SET SESSION sql_mode = ?", [kept.join(",")]);
+  }
+
+  async function prepareSession(
+    client: MySqlClient,
+    timeoutMs: number,
+    rowCap: number | null,
+  ): Promise<void> {
+    await pinSqlMode(client);
+    await setTimeoutVar(client, timeoutMs);
+    if (rowCap !== null) await q(client, `SET SESSION sql_select_limit = ${Math.floor(rowCap)}`);
+  }
+
+  /**
+   * Stream rows and stop after `cap`: an explicit `LIMIT 100000000` overrides sql_select_limit,
+   * so the client must not buffer the whole result. Stopping destroys the connection.
+   */
+  function streamQuery(
+    client: MySqlClient,
+    sql: string,
+    values: unknown[] | undefined,
+    cap: number,
+    timeout: number,
+    onFields: (fields: FieldPacket[]) => void,
+  ): Promise<{ raw: unknown; fields: FieldPacket[] | undefined; aborted: boolean }> {
+    return new Promise((resolve, reject) => {
+      const rows: unknown[] = [];
+      let fields: FieldPacket[] | undefined;
+      let header: unknown;
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+      (client.connection.query({ sql, values, timeout }) as CoreQuery)
+        .on("fields", (f) => {
+          if (!Array.isArray(f)) return; // OK packets (DML) report no columns
+          fields = f;
+          try {
+            onFields(f);
+          } catch (error) {
+            client.connection.destroy();
+            finish(() => reject(error));
+          }
+        })
+        .on("result", (row) => {
+          if (settled) return;
+          if (!fields) {
+            header = row; // OK packet (DML) — no result set
+            return;
+          }
+          rows.push(row);
+          if (rows.length >= cap) {
+            client.connection.destroy();
+            finish(() => resolve({ raw: rows, fields, aborted: true }));
+          }
+        })
+        .on("error", (error) => finish(() => reject(error)))
+        .on("end", () => finish(() => resolve({ raw: fields ? rows : header, fields, aborted: false })));
+    });
+  }
+
+  /**
    * START TRANSACTION READ ONLY (or read-write) with a row cap via sql_select_limit,
    * which bounds what the server sends without rewriting the query.
    */
@@ -136,8 +224,7 @@ export function createMySqlAdapter(
     fn: (client: MySqlClient) => Promise<T>,
   ): Promise<T> {
     return withClient(async (client) => {
-      await setTimeoutVar(client, timeoutMs);
-      if (rowCap !== null) await q(client, `SET SESSION sql_select_limit = ${Math.floor(rowCap)}`);
+      await prepareSession(client, timeoutMs, rowCap);
       await q(client, mode === "read" ? "START TRANSACTION READ ONLY" : "START TRANSACTION");
       try {
         const out = await fn(client);
@@ -257,14 +344,45 @@ export function createMySqlAdapter(
     };
   }
 
-  async function readQuery(sql: string, values: unknown[] | undefined, maxRows: number, timeoutMs: number) {
+  /** One statement in its own transaction, rows streamed and capped (connection dropped when capped). */
+  async function runStatement(
+    mode: "read" | "write" | "dry_run",
+    sql: string,
+    values: unknown[] | undefined,
+    maxRows: number,
+    timeoutMs: number,
+    cls: StatementClass,
+    extra: Partial<QueryResult> = {},
+  ): Promise<QueryResult> {
     const started = Date.now();
-    return inTransaction("read", timeoutMs, maxRows + 1, async (client) => {
-      await enforceSql(client, sql);
-      const [raw, fields] = await q<unknown>(client, sql, values, timeoutMs + 5_000);
-      enforceFields(fields ?? []);
-      return shape(raw, fields, maxRows, "read", { duration_ms: Date.now() - started });
+    return withClient(async (client, discard) => {
+      await prepareSession(client, timeoutMs, maxRows + 1);
+      await q(client, mode === "read" ? "START TRANSACTION READ ONLY" : "START TRANSACTION");
+      let open = true;
+      try {
+        await enforceSql(client, sql);
+        // Writes are never cut short: stopping early would roll back a statement the caller expects committed.
+        const cap = cls === "read" ? maxRows + 1 : Number.POSITIVE_INFINITY;
+        const res = await streamQuery(client, sql, values, cap, timeoutMs + 5_000, (fields) =>
+          enforceFields(fields),
+        );
+        if (res.aborted) {
+          open = false; // destroyed: the server rolls the transaction back
+          discard();
+        } else {
+          await q(client, mode === "write" ? "COMMIT" : "ROLLBACK");
+          open = false;
+        }
+        return shape(res.raw, res.fields, maxRows, cls, { ...extra, duration_ms: Date.now() - started });
+      } finally {
+        if (open) await q(client, "ROLLBACK").catch(() => undefined);
+        await q(client, "SET SESSION sql_select_limit = DEFAULT").catch(() => undefined);
+      }
     });
+  }
+
+  function readQuery(sql: string, values: unknown[] | undefined, maxRows: number, timeoutMs: number) {
+    return runStatement("read", sql, values, maxRows, timeoutMs, "read");
   }
 
   async function resolveTable(client: MySqlClient, ref: TableRef) {
@@ -490,19 +608,14 @@ export function createMySqlAdapter(
         throw new Error(`statement needs ${input.classified} access`);
       const started = Date.now();
       if (input.classified !== "admin") {
-        return inTransaction(
+        return runStatement(
           input.dryRun ? "dry_run" : "write",
+          input.sql,
+          values,
+          input.maxRows,
           input.timeoutMs,
-          input.maxRows + 1,
-          async (client) => {
-            await enforceSql(client, input.sql);
-            const [raw, fields] = await q<unknown>(client, input.sql, values, input.timeoutMs + 5_000);
-            enforceFields(fields ?? []);
-            return shape(raw, fields, input.maxRows, input.classified, {
-              ...(input.dryRun ? { rolled_back: true } : {}),
-              duration_ms: Date.now() - started,
-            });
-          },
+          input.classified,
+          input.dryRun ? { rolled_back: true } : {},
         );
       }
       if (policy) throw new Error("admin statements are disabled on connections with a schema/column policy");
@@ -511,7 +624,7 @@ export function createMySqlAdapter(
       }
       // admin DDL: autocommit, one statement.
       return withClient(async (client) => {
-        await setTimeoutVar(client, input.timeoutMs);
+        await prepareSession(client, input.timeoutMs, null);
         const [raw, fields] = await q<unknown>(client, input.sql, values, input.timeoutMs + 5_000);
         return shape(raw, fields, input.maxRows, input.classified, { duration_ms: Date.now() - started });
       });

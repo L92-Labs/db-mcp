@@ -4,11 +4,15 @@ import {
   assertSqlPolicy,
   columnHidden,
   describePolicy,
+  hasStarProjection,
+  mentionsHidden,
   policyFor,
+  positionalInsertTarget,
+  positionalMergeTarget,
   schemaAllowed,
   type Policy,
 } from "./policy.js";
-import { accessToClass, assertSqlAllowed, classifySql } from "./sql/classify.js";
+import { accessToClass, assertSqlAllowed, classifySql, splitStatements } from "./sql/classify.js";
 import { TOOL_NAMES, WRITE_TOOLS, toolSchemas, type ToolName } from "./tools.js";
 import type { AdapterFactory, ConnectionConfig, DbAdapter, QueryResult, RuntimeConfig } from "./types.js";
 
@@ -61,6 +65,83 @@ function assertSchema(policy: Policy | null, schema: string | undefined | null, 
   if (!schemaAllowed(policy, schema)) {
     throw new Error(`schema "${schema}" is outside the allowlist of connection "${connection}"`);
   }
+}
+
+/** INSERT/REPLACE/MERGE without a column list writes every column, hidden ones included. */
+async function assertPositionalWrite(sql: string, policy: Policy, adapter: DbAdapter, connection: string) {
+  for (const tokens of splitStatements(sql, adapter.engine)) {
+    const target = positionalInsertTarget(tokens) ?? positionalMergeTarget(tokens);
+    if (!target) continue;
+    const d = await adapter.describeTable(target);
+    const cols = (d.columns as Array<{ name: string }> | undefined) ?? [];
+    const hit = cols.find((c) =>
+      columnHidden(policy, {
+        schema: d.schema as string,
+        table: String(d.name ?? target.table),
+        column: lastPart(c.name),
+      }),
+    );
+    if (hit) {
+      throw new Error(
+        `${target.table} has hidden columns; list the columns you write (INSERT INTO ${target.table} (a, b) …) on connection "${connection}"`,
+      );
+    }
+  }
+}
+
+/** Remove keys, indexes, references and view SQL that would reveal hidden columns or other schemas. */
+async function redactDescription(
+  policy: Policy,
+  d: Record<string, unknown>,
+  table: string,
+  adapter: DbAdapter,
+): Promise<Record<string, unknown>> {
+  let known: string[] | null = null;
+  const foreignSchema = async (text: string): Promise<boolean> => {
+    if (!policy.schemas) return false;
+    known ??= (await adapter.listSchemas({ includeSystem: true })).map((s) => String(s.name));
+    const qualifiers = [...text.matchAll(/(?:"([^"]+)"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_$]*))\s*\./g)].map(
+      (m) => (m[1] ?? m[2] ?? m[3])!,
+    );
+    return qualifiers.some(
+      (q) => known!.some((k) => k === q || k.toLowerCase() === q.toLowerCase()) && !schemaAllowed(policy, q),
+    );
+  };
+  const out: Record<string, unknown> = { ...d };
+  let removed = 0;
+  const keep = async (item: unknown, ownerTable = table) => {
+    const text = typeof item === "string" ? item : JSON.stringify(item);
+    const drop = mentionsHidden(policy, text, ownerTable) || (await foreignSchema(text));
+    if (drop) removed++;
+    return !drop;
+  };
+  if (typeof out.primary_key === "string" && !(await keep(out.primary_key))) out.primary_key = "(hidden)";
+  for (const key of ["constraints", "indexes"] as const) {
+    if (!Array.isArray(out[key])) continue;
+    const kept = [];
+    for (const item of out[key] as unknown[]) if (await keep(item)) kept.push(item);
+    out[key] = kept;
+  }
+  if (Array.isArray(out.referenced_by)) {
+    const kept = [];
+    for (const item of out.referenced_by as Array<{ table?: string }>) {
+      const ref = String(item.table ?? "");
+      const refSchema = ref.includes(".") ? ref.slice(0, ref.lastIndexOf(".")) : undefined;
+      const refTable = ref.split(".").pop()!;
+      if (schemaAllowed(policy, refSchema) && (await keep(item, refTable))) kept.push(item);
+      else if (!schemaAllowed(policy, refSchema)) removed++;
+    }
+    out.referenced_by = kept;
+  }
+  if (typeof out.view_definition === "string" && !(await keep(out.view_definition)))
+    delete out.view_definition;
+  if (Array.isArray(out.clustering)) {
+    out.clustering = (out.clustering as string[]).filter((c) => !columnHidden(policy, { table, column: c }));
+  }
+  const part = out.partitioning as { field?: string } | null | undefined;
+  if (part?.field && columnHidden(policy, { table, column: part.field })) out.partitioning = { hidden: true };
+  if (removed > 0) out.redacted_items = removed;
+  return out;
 }
 
 function lastPart(name: string): string {
@@ -159,9 +240,10 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
             !columnHidden(policy, { schema, table, column: c.name.split(".")[0]! }),
         );
         const hidden = d.columns.length - visible.length;
+        const redacted = await redactDescription(policy, d, table, ctx.adapterFor(connection));
         return {
           connection: connection.name,
-          ...d,
+          ...redacted,
           columns: visible,
           ...(hidden ? { hidden_columns: hidden } : {}),
         };
@@ -183,9 +265,22 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
       const policy = policyFor(connection);
       const schema = a.schema?.trim() || undefined;
       assertSchema(policy, schema, connection.name);
-      const columns = (
-        await ctx.adapterFor(connection).searchColumns({ pattern: a.pattern, schema, limit: a.limit ?? 200 })
-      ).filter(
+      const limit = a.limit ?? 200;
+      const adapter = ctx.adapterFor(connection);
+      let found: Record<string, unknown>[];
+      if (!schema && policy?.schemas) {
+        // Search each allowed schema so forbidden ones cannot use up the limit.
+        found = [];
+        for (const s of policy.schemas) {
+          if (found.length >= limit) break;
+          found.push(
+            ...(await adapter.searchColumns({ pattern: a.pattern, schema: s, limit: limit - found.length })),
+          );
+        }
+      } else {
+        found = await adapter.searchColumns({ pattern: a.pattern, schema, limit });
+      }
+      const columns = found.filter(
         (c) =>
           schemaAllowed(policy, c.schema as string) &&
           !columnHidden(policy, {
@@ -208,13 +303,11 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
         connection: connection.name,
         tool,
       });
-      assertSqlPolicy(
-        a.sql,
-        connection.engine,
-        policyFor(connection),
-        classified.statements,
-        connection.name,
-      );
+      const policy = policyFor(connection);
+      assertSqlPolicy(a.sql, connection.engine, policy, classified.statements, connection.name);
+      if (policy?.rules.length && classified.class === "write") {
+        await assertPositionalWrite(a.sql, policy, ctx.adapterFor(connection), connection.name);
+      }
       const dryRun = tool === "sql_execute" && a.dry_run === true;
       const result = await ctx.adapterFor(connection).run({
         sql: a.sql,
@@ -236,13 +329,18 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
       if (classified.statements[0]!.keyword === "EXPLAIN") {
         throw new Error("pass the statement itself; sql_explain adds EXPLAIN");
       }
-      assertSqlPolicy(
-        a.sql,
-        connection.engine,
-        policyFor(connection),
-        classified.statements,
-        connection.name,
-      );
+      const policy = policyFor(connection);
+      assertSqlPolicy(a.sql, connection.engine, policy, classified.statements, connection.name);
+      if (
+        policy?.rules.length &&
+        connection.engine !== "postgres" &&
+        splitStatements(a.sql, connection.engine).some(hasStarProjection)
+      ) {
+        // Plans list the columns a * expands to; Postgres checks its plan instead.
+        throw new Error(
+          `list columns explicitly: SELECT * is refused by sql_explain on connection "${connection.name}" (hidden columns)`,
+        );
+      }
       const plan = await ctx.adapterFor(connection).explain({ sql: a.sql, params: a.params, timeoutMs });
       return { connection: connection.name, statement_class: classified.class, ...plan };
     }

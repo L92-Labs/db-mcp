@@ -8,6 +8,12 @@ import {
   loadRuntimeConfig,
   policyFor,
   assertSqlPolicy,
+  hasStarProjection,
+  mentionsHidden,
+  positionalInsertTarget,
+  positionalMergeTarget,
+  schemaAllowed,
+  splitStatements,
   type ConnectionConfig,
 } from "@db-mcp/core";
 
@@ -159,5 +165,82 @@ describe("audit entry", () => {
       error: new Error("nope"),
     });
     expect(failed).toMatchObject({ ok: false, error: "nope" });
+  });
+});
+
+describe("policy (review fixes)", () => {
+  const tokens = (sql: string, engine: "postgres" | "mysql" | "bigquery" = "mysql") =>
+    splitStatements(sql, engine)[0]!;
+
+  it("table-scoped rules only fire when their table is named", () => {
+    const p = policyFor(conn({ hiddenColumns: ["customers.api_token"] }))!;
+    const check = (sql: string) =>
+      assertSqlPolicy(sql, "postgres", p, classifySql(sql, "postgres").statements, "c");
+    expect(() => check("SELECT api_token FROM orders")).not.toThrow();
+    expect(() => check("SELECT api_token FROM customers")).toThrow(/customers.api_token/);
+  });
+
+  it("Postgres schema names are exact; BigQuery accepts project.dataset", () => {
+    const pg = policyFor(conn({ schemas: ["shop"] }))!;
+    expect(schemaAllowed(pg, "shop")).toBe(true);
+    expect(schemaAllowed(pg, "SHOP")).toBe(false);
+    expect(schemaAllowed(pg, "other.shop")).toBe(false);
+    const bq = policyFor(conn({ engine: "bigquery", schemas: ["analytics"] } as Partial<ConnectionConfig>))!;
+    expect(schemaAllowed(bq, "proj.analytics")).toBe(true);
+    expect(schemaAllowed(bq, "proj.hr")).toBe(false);
+  });
+
+  it("finds positional INSERT/REPLACE/MERGE targets", () => {
+    expect(positionalInsertTarget(tokens("INSERT INTO shop.customers VALUES (1)"))).toEqual({
+      schema: "shop",
+      table: "customers",
+    });
+    expect(positionalInsertTarget(tokens("REPLACE customers SELECT * FROM x"))).toEqual({
+      table: "customers",
+    });
+    expect(positionalInsertTarget(tokens("INSERT INTO customers (id, email) VALUES (1, 'a')"))).toBeNull();
+    expect(positionalInsertTarget(tokens("INSERT INTO customers SET email = 'a'"))).toBeNull();
+    expect(positionalInsertTarget(tokens("INSERT INTO `proj.ds.users` VALUES (1)", "bigquery"))).toEqual({
+      schema: "proj.ds",
+      table: "users",
+    });
+    expect(
+      positionalMergeTarget(
+        tokens("MERGE ds.users t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT ROW", "bigquery"),
+      ),
+    ).toEqual({ schema: "ds", table: "users" });
+    expect(
+      positionalMergeTarget(
+        tokens("MERGE ds.users t USING s ON true WHEN NOT MATCHED THEN INSERT (id) VALUES (1)", "bigquery"),
+      ),
+    ).toBeNull();
+  });
+
+  it("detects SELECT * projections but not multiplication or COUNT(*)", () => {
+    expect(hasStarProjection(tokens("INSERT INTO a SELECT * FROM b"))).toBe(true);
+    expect(hasStarProjection(tokens("INSERT INTO a SELECT b.* FROM b"))).toBe(true);
+    expect(hasStarProjection(tokens("INSERT INTO a SELECT id, * FROM b"))).toBe(true);
+    expect(hasStarProjection(tokens("UPDATE t SET a = a * 2"))).toBe(false);
+    expect(hasStarProjection(tokens("INSERT INTO a SELECT COUNT(*) FROM b"))).toBe(false);
+  });
+
+  it("refuses SELECT * in writes and MySQL metadata statements on guarded connections", () => {
+    const p = policyFor(
+      conn({ engine: "mysql", hiddenColumns: ["api_token"] } as Partial<ConnectionConfig>),
+    )!;
+    const check = (sql: string) =>
+      assertSqlPolicy(sql, "mysql", p, classifySql(sql, "mysql").statements, "c");
+    expect(() => check("INSERT INTO archive SELECT * FROM customers")).toThrow(/SELECT \*/);
+    expect(() => check("SHOW DATABASES")).toThrow(/disabled/);
+    expect(() => check("DESCRIBE customers")).toThrow(/disabled/);
+    expect(() => check("SELECT * FROM customers")).not.toThrow(); // reads are checked on result columns
+  });
+
+  it("mentionsHidden respects table scope", () => {
+    const p = policyFor(conn({ hiddenColumns: ["customers.api_token"] }))!;
+    expect(mentionsHidden(p, "CREATE INDEX i ON shop.customers USING btree (api_token)", "customers")).toBe(
+      true,
+    );
+    expect(mentionsHidden(p, "CREATE INDEX i ON shop.orders USING btree (api_token)", "orders")).toBe(false);
   });
 });
