@@ -47,6 +47,8 @@ export async function buildAuditEntry(opts: {
   result?: Record<string, unknown>;
   error?: unknown;
   startedAt: number;
+  /** Used when the call omitted `connection` (failed calls have no result to read it from). */
+  defaultConnection?: string;
 }): Promise<AuditEntry> {
   const { args, result } = opts;
   const sql = typeof args.sql === "string" ? args.sql : undefined;
@@ -58,7 +60,9 @@ export async function buildAuditEntry(opts: {
     ok: opts.error === undefined,
     duration_ms: Date.now() - opts.startedAt,
   };
-  const connection = (result?.connection ?? args.connection) as string | undefined;
+  const connection = (result?.connection ??
+    args.connection ??
+    (opts.tool === "connections_list" ? undefined : opts.defaultConnection)) as string | undefined;
   if (connection) entry.connection = connection;
   if (result) {
     if (typeof result.statement_class === "string") entry.statement_class = result.statement_class;

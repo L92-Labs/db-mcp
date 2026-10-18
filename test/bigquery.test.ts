@@ -352,3 +352,38 @@ describe("BigQuery positional DML under hidden columns", () => {
     expect(calls.some((c) => c.url.endsWith("/queries"))).toBe(false);
   });
 });
+
+describe("BigQuery describe redaction", () => {
+  it("masks a STRUCT parent type that lists a hidden child", async () => {
+    const f = (async () =>
+      new Response(
+        JSON.stringify({
+          type: "TABLE",
+          schema: {
+            fields: [
+              { name: "id", type: "INT64" },
+              {
+                name: "address",
+                type: "RECORD",
+                fields: [
+                  { name: "secret", type: "STRING" },
+                  { name: "city", type: "STRING" },
+                ],
+              },
+            ],
+          },
+        }),
+      )) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "proj",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_HIDDEN_COLUMNS: "secret",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    const d = (await dispatchTool("table_describe", { table: "ds.users" }, ctx)) as any;
+    expect(d.columns.map((c: any) => c.name)).toEqual(["id", "address", "address.city"]);
+    expect(JSON.stringify(d.columns)).not.toContain("secret");
+  });
+});

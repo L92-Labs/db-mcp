@@ -391,3 +391,21 @@ describe.skipIf(!url)("postgres review fixes round 3 (live)", () => {
     expect(r).toMatchObject({ affected_rows: 3, row_count: 1, truncated: true, rolled_back: true });
   });
 });
+
+describe.skipIf(!url)("postgres review fixes round 4 (live)", () => {
+  const guarded = url
+    ? ctxFor("read_write", { DATABASE_SCHEMAS: "shop", DATABASE_HIDDEN_COLUMNS: "customers.api_token" })
+    : (undefined as never);
+  it("a positional INSERT after a data-modifying CTE is refused", async () => {
+    await expect(
+      dispatchTool(
+        "sql_execute",
+        {
+          sql: "WITH x AS (INSERT INTO shop.orders (customer_id, total_cents) VALUES (1, 1) RETURNING id) INSERT INTO shop.customers VALUES (99, 'x@y.z', 'X', 'tok', now())",
+          dry_run: true,
+        },
+        guarded,
+      ),
+    ).rejects.toThrow(/list the columns/);
+  });
+});

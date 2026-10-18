@@ -1,4 +1,10 @@
-import { identifierTokens, splitStatements, type StatementInfo, type Token } from "./sql/classify.js";
+import {
+  identifierTokens,
+  qualifierTokens,
+  splitStatements,
+  type StatementInfo,
+  type Token,
+} from "./sql/classify.js";
 import type { ConnectionConfig, Engine } from "./types.js";
 
 /**
@@ -18,6 +24,10 @@ export type Policy = {
   engine: Engine;
   schemas: string[] | null;
   rules: Rule[];
+  /** BigQuery: project that unqualified datasets belong to. */
+  project?: string;
+  /** MySQL: compare schema names case-insensitively (server lower_case_table_names ≠ 0). */
+  foldCase?: boolean;
 };
 
 function glob(pattern: string): RegExp {
@@ -45,22 +55,29 @@ export function policyFor(connection: ConnectionConfig): Policy | null {
   const schemas = connection.schemas?.length ? connection.schemas : null;
   const rules = (connection.hiddenColumns ?? []).map(parseRule);
   if (!schemas && rules.length === 0) return null;
-  return { engine: connection.engine, schemas, rules };
+  return {
+    engine: connection.engine,
+    schemas,
+    rules,
+    project: connection.engine === "bigquery" ? connection.projectId : undefined,
+  };
 }
 
 /**
- * Engine semantics: Postgres schema names are exact (quoted "SHOP" ≠ shop); MySQL compares
- * case-insensitively; BigQuery datasets may be written "dataset" or "project.dataset".
+ * Engine semantics: Postgres schema names are exact (quoted "SHOP" ≠ shop); MySQL is exact
+ * unless the server folds case; BigQuery compares fully qualified project.dataset names,
+ * unqualified ones belonging to the connection's project.
  */
 export function schemaAllowed(policy: Policy | null, schema: string | null | undefined): boolean {
   if (!policy?.schemas || schema === null || schema === undefined) return true;
   if (policy.engine === "postgres") return policy.schemas.includes(schema);
-  if (policy.engine === "mysql") return policy.schemas.some((a) => a.toLowerCase() === schema.toLowerCase());
-  const dataset = (name: string) => name.split(".").pop()!;
-  return policy.schemas.some((allowed) => {
-    if (allowed.includes(".") && schema.includes(".")) return allowed === schema;
-    return dataset(allowed) === dataset(schema);
-  });
+  if (policy.engine === "mysql") {
+    return policy.foldCase
+      ? policy.schemas.some((a) => a.toLowerCase() === schema.toLowerCase())
+      : policy.schemas.includes(schema);
+  }
+  const qualify = (name: string) => (name.includes(".") ? name : `${policy.project ?? ""}.${name}`);
+  return policy.schemas.some((allowed) => qualify(allowed) === qualify(schema));
 }
 
 export function columnHidden(
@@ -116,28 +133,44 @@ export function hasStarProjection(tokens: Token[]): boolean {
 }
 
 /** Target of `INSERT/REPLACE [INTO] t VALUES|SELECT …` without a column list, if any. */
+/** Every `INSERT/REPLACE [INTO] t VALUES|SELECT …` without a column list (CTEs included). */
+export function positionalInsertTargets(tokens: Token[]): Array<{ schema?: string; table: string }> {
+  if (isWord(tokens[0], "MERGE")) return []; // see positionalMergeTarget
+  const out: Array<{ schema?: string; table: string }> = [];
+  tokens.forEach((t, start) => {
+    if (!isWord(t, "INSERT") && !isWord(t, "REPLACE")) return;
+    let i = start + 1;
+    const skip = new Set([
+      "INTO",
+      "IGNORE",
+      "LOW_PRIORITY",
+      "DELAYED",
+      "HIGH_PRIORITY",
+      "OVERWRITE",
+      "TABLE",
+    ]);
+    while (isWord(tokens[i]) && skip.has((tokens[i] as { value: string }).value)) i++;
+    const target = targetAfter(tokens, i);
+    if (!target) return;
+    i = targetEnd(tokens, i);
+    // Alias (Postgres `INSERT INTO t AS x (…)`) before the column list
+    if (isWord(tokens[i], "AS")) i += 2;
+    const after = tokens[i];
+    // `()` is MySQL's "all defaults" form: still writes every column.
+    const hasColumnList =
+      isPunct(after, "(") &&
+      !isWord(tokens[i + 1], "SELECT") &&
+      !isWord(tokens[i + 1], "WITH") &&
+      !isPunct(tokens[i + 1], ")");
+    if (hasColumnList || isWord(after, "SET")) return;
+    out.push(target);
+  });
+  return out;
+}
+
+/** First positional INSERT/REPLACE target, if any. */
 export function positionalInsertTarget(tokens: Token[]): { schema?: string; table: string } | null {
-  if (isWord(tokens[0], "MERGE")) return null; // see positionalMergeTarget
-  const start = tokens.findIndex((t) => isWord(t, "INSERT") || isWord(t, "REPLACE"));
-  if (start === -1) return null;
-  let i = start + 1;
-  const skip = new Set(["INTO", "IGNORE", "LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "OVERWRITE", "TABLE"]);
-  while (isWord(tokens[i]) && skip.has((tokens[i] as { value: string }).value)) i++;
-  const target = targetAfter(tokens, i);
-  if (!target) return null;
-  i = targetEnd(tokens, i);
-  const next = tokens[i];
-  // Alias (Postgres `INSERT INTO t AS x (…)`) before the column list
-  if (isWord(next, "AS")) i += 2;
-  const after = tokens[i];
-  // `()` is MySQL's "all defaults" form: still writes every column.
-  const hasColumnList =
-    isPunct(after, "(") &&
-    !isWord(tokens[i + 1], "SELECT") &&
-    !isWord(tokens[i + 1], "WITH") &&
-    !isPunct(tokens[i + 1], ")");
-  if (hasColumnList || isWord(after, "SET")) return null;
-  return target;
+  return positionalInsertTargets(tokens)[0] ?? null;
 }
 
 /** `MERGE [INTO] t … INSERT ROW | INSERT VALUES (…)` writes every column positionally. */
@@ -183,6 +216,44 @@ function targetAfter(tokens: Token[], from: number): { schema?: string; table: s
   };
 }
 
+/** Table names in the statement with their qualifier (`s.t` → {s, t}; bare `t` → {t}). */
+function tableRefs(tokens: Token[]): Array<{ qualifier?: string; name: string }> {
+  const out: Array<{ qualifier?: string; name: string }> = [];
+  tokens.forEach((t, i) => {
+    if (t.kind === "ident" && t.value.includes(".")) {
+      const parts = t.value.split(".");
+      out.push({ qualifier: parts[parts.length - 2], name: parts[parts.length - 1]! });
+      return;
+    }
+    if (t.kind !== "word" && t.kind !== "ident") return;
+    const name = t.kind === "word" ? t.raw : t.value;
+    const prev = tokens[i - 2];
+    const qualifier =
+      isPunct(tokens[i - 1], ".") && (prev?.kind === "word" || prev?.kind === "ident")
+        ? prev.kind === "word"
+          ? prev.raw
+          : prev.value.split(".").pop()
+        : undefined;
+    out.push({ qualifier, name });
+  });
+  return out;
+}
+
+/** A hidden rule applies when its column is named and its table (and schema, when qualified) match. */
+function ruleApplies(rule: Rule, tokens: Token[], idents: string[]): string | null {
+  const column = idents.find((id) => rule.column.test(id));
+  if (!column) return null;
+  if (!rule.table) return column;
+  const hit = tableRefs(tokens).some(
+    (r) =>
+      rule.table!.test(r.name) &&
+      (!rule.schema || r.qualifier === undefined || rule.schema.test(r.qualifier)),
+  );
+  return hit ? column : null;
+}
+
+const SYSTEM_SCHEMAS = new Set(["INFORMATION_SCHEMA", "PERFORMANCE_SCHEMA", "MYSQL", "SYS"]);
+
 const MYSQL_METADATA_KEYWORDS = new Set(["SHOW", "DESCRIBE", "DESC", "EXPLAIN"]);
 
 /** Engine-agnostic SQL checks: admin statements, hidden column names, catalog access. */
@@ -208,19 +279,19 @@ export function assertSqlPolicy(
     );
   }
   const tokens = splitStatements(sql, engine);
-  const idents = tokens.flatMap(identifierTokens);
-  for (const id of idents) {
-    const rule = policy.rules.find(
-      (r) => r.column.test(id) && (!r.table || idents.some((other) => r.table!.test(other))),
-    );
-    if (rule) {
-      throw new Error(`"${id}" matches hidden column pattern "${rule.source}" on connection "${connection}"`);
+  for (const stmt of tokens) {
+    const idents = identifierTokens(stmt);
+    for (const rule of policy.rules) {
+      const id = ruleApplies(rule, stmt, idents);
+      if (id)
+        throw new Error(
+          `"${id}" matches hidden column pattern "${rule.source}" on connection "${connection}"`,
+        );
     }
     if (policy.schemas && engine !== "postgres") {
-      const u = id.toUpperCase();
-      if (u === "INFORMATION_SCHEMA" || u === "PERFORMANCE_SCHEMA" || u === "MYSQL" || u === "SYS") {
-        throw new Error(`${id} is outside the schema allowlist of connection "${connection}"`);
-      }
+      // Catalog schemas only matter as qualifiers (`information_schema.tables`), not as column names.
+      const system = qualifierTokens(stmt).find((q) => SYSTEM_SCHEMAS.has(q.toUpperCase()));
+      if (system) throw new Error(`${system} is outside the schema allowlist of connection "${connection}"`);
     }
   }
   // Writes return no result columns to check, so `INSERT … SELECT *` could copy hidden data out.

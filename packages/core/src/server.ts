@@ -57,6 +57,7 @@ export function buildMcpServer(ctx: DispatchContext, opts: BuildServerOptions = 
           result: result as Record<string, unknown> | undefined,
           error,
           startedAt,
+          defaultConnection: ctx.config.defaultConnection,
         }),
       );
     } catch {

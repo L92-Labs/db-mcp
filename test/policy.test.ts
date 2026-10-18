@@ -11,6 +11,7 @@ import {
   hasStarProjection,
   mentionsHidden,
   positionalInsertTarget,
+  positionalInsertTargets,
   positionalMergeTarget,
   schemaAllowed,
   splitStatements,
@@ -191,7 +192,9 @@ describe("policy (review fixes)", () => {
     expect(schemaAllowed(pg, "shop")).toBe(true);
     expect(schemaAllowed(pg, "SHOP")).toBe(false);
     expect(schemaAllowed(pg, "other.shop")).toBe(false);
-    const bq = policyFor(conn({ engine: "bigquery", schemas: ["analytics"] } as Partial<ConnectionConfig>))!;
+    const bq = policyFor(
+      conn({ engine: "bigquery", projectId: "proj", schemas: ["analytics"] } as Partial<ConnectionConfig>),
+    )!;
     expect(schemaAllowed(bq, "proj.analytics")).toBe(true);
     expect(schemaAllowed(bq, "proj.hr")).toBe(false);
   });
@@ -248,5 +251,68 @@ describe("policy (review fixes)", () => {
       true,
     );
     expect(mentionsHidden(p, "CREATE INDEX i ON shop.orders USING btree (api_token)", "orders")).toBe(false);
+  });
+});
+
+describe("policy (review round 4)", () => {
+  const tokens = (sql: string, engine: "postgres" | "mysql" | "bigquery" = "postgres") =>
+    splitStatements(sql, engine)[0]!;
+
+  it("finds every positional INSERT, including the main one after a CTE", () => {
+    expect(
+      positionalInsertTargets(
+        tokens(
+          "WITH x AS (INSERT INTO audit (message) VALUES ('x') RETURNING 1) INSERT INTO customers VALUES (1)",
+        ),
+      ),
+    ).toEqual([{ table: "customers" }]);
+  });
+
+  it("schema-qualified rules respect the schema of a qualified table", () => {
+    const p = policyFor(conn({ hiddenColumns: ["private.users.ssn"] }))!;
+    const check = (sql: string) =>
+      assertSqlPolicy(sql, "postgres", p, classifySql(sql, "postgres").statements, "c");
+    expect(() => check("SELECT ssn FROM public.users")).not.toThrow();
+    expect(() => check("SELECT ssn FROM private.users")).toThrow(/hidden/);
+    expect(() => check("SELECT ssn FROM users")).toThrow(/hidden/); // unqualified: could resolve to private
+  });
+
+  it("BigQuery project-qualified allowlist entries need the project", () => {
+    const p = policyFor(
+      conn({
+        engine: "bigquery",
+        projectId: "other-project",
+        schemas: ["allowed-project.analytics"],
+      } as Partial<ConnectionConfig>),
+    )!;
+    expect(schemaAllowed(p, "analytics")).toBe(false);
+    expect(schemaAllowed(p, "allowed-project.analytics")).toBe(true);
+  });
+
+  it("system schema names are refused only as qualifiers", () => {
+    const p = policyFor(conn({ engine: "mysql", schemas: ["shop"] } as Partial<ConnectionConfig>))!;
+    const check = (sql: string) =>
+      assertSqlPolicy(sql, "mysql", p, classifySql(sql, "mysql").statements, "c");
+    expect(() => check("SELECT sys, mysql FROM shop.metrics")).not.toThrow();
+    expect(() => check("SELECT * FROM sys.processlist")).toThrow(/allowlist/);
+  });
+
+  it("MySQL schema matching is exact unless the server folds case", () => {
+    const p = policyFor(conn({ engine: "mysql", schemas: ["shop"] } as Partial<ConnectionConfig>))!;
+    expect(schemaAllowed(p, "SHOP")).toBe(false);
+    expect(schemaAllowed({ ...p, foldCase: true }, "SHOP")).toBe(true);
+  });
+
+  it("audit entries fall back to the default connection", async () => {
+    const e = await buildAuditEntry({
+      mode: "meta",
+      principal: "p",
+      tool: "sql_query",
+      args: { sql: "DROP TABLE x" },
+      error: new Error("refused"),
+      startedAt: Date.now(),
+      defaultConnection: "main",
+    });
+    expect(e.connection).toBe("main");
   });
 });

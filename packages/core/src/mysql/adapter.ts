@@ -93,6 +93,7 @@ export function createMySqlAdapter(
   opts: { connect: MySqlConnector },
 ): DbAdapter {
   const policy = policyFor(connection);
+  let caseChecked = false;
   let timeoutVar: "max_execution_time" | "max_statement_time" | null | undefined;
 
   async function withClient<T>(fn: (client: MySqlClient, discard: () => void) => Promise<T>): Promise<T> {
@@ -171,6 +172,7 @@ export function createMySqlAdapter(
     sql: string,
     values: unknown[] | undefined,
     cap: number,
+    keep: number,
     timeout: number,
     onFields: (fields: FieldPacket[]) => void,
   ): Promise<{ raw: unknown; fields: FieldPacket[] | undefined; aborted: boolean }> {
@@ -178,6 +180,7 @@ export function createMySqlAdapter(
       const rows: unknown[] = [];
       let fields: FieldPacket[] | undefined;
       let header: unknown;
+      let seen = 0;
       let settled = false;
       const finish = (fn: () => void) => {
         if (settled) return;
@@ -201,8 +204,9 @@ export function createMySqlAdapter(
             header = row; // OK packet (DML) — no result set
             return;
           }
-          rows.push(row);
-          if (rows.length >= cap) {
+          seen++;
+          if (rows.length < keep) rows.push(row); // drained rows past `keep` are discarded
+          if (seen >= cap) {
             client.connection.destroy();
             finish(() => resolve({ raw: rows, fields, aborted: true }));
           }
@@ -261,8 +265,17 @@ export function createMySqlAdapter(
   }
 
   /** Before running: default database and every schema-qualified name must be allowed. */
+  /** lower_case_table_names = 0 → database names are case-sensitive (shop ≠ SHOP). */
+  async function detectCaseFolding(client: MySqlClient): Promise<void> {
+    if (!policy || caseChecked) return;
+    const [[row]] = await q<RowDataPacket[]>(client, "SELECT @@lower_case_table_names AS lctn");
+    policy.foldCase = Number(row?.lctn ?? 0) !== 0;
+    caseChecked = true;
+  }
+
   async function enforceSql(client: MySqlClient, sql: string): Promise<void> {
     if (!policy) return;
+    await detectCaseFolding(client);
     await enforceViews(client, sql);
     if (!policy.schemas) return;
     const [[row]] = await q<RowDataPacket[]>(client, "SELECT DATABASE() AS db");
@@ -344,6 +357,57 @@ export function createMySqlAdapter(
         }
       }
       views = next;
+    }
+    if (views.length > 0) {
+      throw new Error(`view chain is nested more than 10 levels; refused on connection "${connection.name}"`);
+    }
+  }
+
+  /**
+   * ROLLBACK cannot undo MyISAM/MEMORY/ARCHIVE writes, nor what triggers do. A dry run is only
+   * honest when every table the statement names is transactional and none has triggers.
+   */
+  async function assertRollbackSafe(client: MySqlClient, sql: string): Promise<void> {
+    const names = [
+      ...new Set(
+        splitStatements(sql, "mysql")
+          .flatMap(identifierTokens)
+          .map((n) => n.toLowerCase()),
+      ),
+    ];
+    if (names.length === 0) return;
+    const tables = await metaQuery<{ schema: string; name: string; type: string; engine: string | null }>(
+      client,
+      `SELECT TABLE_SCHEMA AS \`schema\`, TABLE_NAME AS name, TABLE_TYPE AS type, ENGINE AS engine
+       FROM information_schema.TABLES
+       WHERE LOWER(TABLE_NAME) IN (?) AND TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')`,
+      [names],
+    );
+    for (const t of tables) {
+      if (t.type === "VIEW") {
+        throw new Error(
+          `dry_run is refused through views (${t.schema}.${t.name}): rollback cannot be verified`,
+        );
+      }
+      if (
+        t.type === "BASE TABLE" &&
+        !["innodb", "ndbcluster", "ndb"].includes(String(t.engine).toLowerCase())
+      ) {
+        throw new Error(
+          `dry_run is refused: ${t.schema}.${t.name} uses ${t.engine}, which cannot roll back (the write would be real)`,
+        );
+      }
+    }
+    const triggers = await metaQuery<{ name: string; table: string }>(
+      client,
+      `SELECT TRIGGER_NAME AS name, EVENT_OBJECT_TABLE AS \`table\` FROM information_schema.TRIGGERS
+       WHERE LOWER(EVENT_OBJECT_TABLE) IN (?)`,
+      [names],
+    );
+    if (triggers.length > 0) {
+      throw new Error(
+        `dry_run is refused: ${triggers[0]!.table} has trigger ${triggers[0]!.name}, whose side effects may not roll back`,
+      );
     }
   }
 
@@ -427,9 +491,10 @@ export function createMySqlAdapter(
       let open = true;
       try {
         await enforceSql(client, sql);
+        if (mode === "dry_run") await assertRollbackSafe(client, sql);
         // Writes are never cut short: stopping early would roll back a statement the caller expects committed.
         const cap = cls === "read" ? maxRows + 1 : Number.POSITIVE_INFINITY;
-        const res = await streamQuery(client, sql, values, cap, timeoutMs + 5_000, (fields) =>
+        const res = await streamQuery(client, sql, values, cap, maxRows + 1, timeoutMs + 5_000, (fields) =>
           enforceFields(fields),
         );
         if (res.aborted) {

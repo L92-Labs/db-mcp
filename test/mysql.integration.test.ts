@@ -331,3 +331,29 @@ describe.skipIf(!url)("mysql review fixes round 3 (live)", () => {
     }
   });
 });
+
+describe.skipIf(!url)("mysql review fixes round 4 (live)", () => {
+  it("dry_run is refused on non-transactional tables and tables with triggers", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE TABLE IF NOT EXISTS shop.legacy (id INT) ENGINE=MyISAM");
+    await root.query("INSERT INTO shop.legacy VALUES (1)");
+    await root.query("CREATE TABLE IF NOT EXISTS shop.audited (id INT) ENGINE=InnoDB");
+    await root.query(
+      "CREATE TRIGGER audited_ai AFTER INSERT ON shop.audited FOR EACH ROW INSERT INTO shop.legacy VALUES (NEW.id)",
+    );
+    try {
+      await expect(
+        dispatchTool("sql_execute", { sql: "DELETE FROM legacy", dry_run: true }, rw),
+      ).rejects.toThrow(/MyISAM/);
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM shop.legacy")) as any;
+      expect(Number(n)).toBe(1);
+      await expect(
+        dispatchTool("sql_execute", { sql: "INSERT INTO audited (id) VALUES (2)", dry_run: true }, rw),
+      ).rejects.toThrow(/trigger/);
+    } finally {
+      await root.query("DROP TABLE shop.legacy, shop.audited");
+      await root.end();
+    }
+  });
+});

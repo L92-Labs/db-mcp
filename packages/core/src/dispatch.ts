@@ -7,7 +7,7 @@ import {
   hasStarProjection,
   mentionsHidden,
   policyFor,
-  positionalInsertTarget,
+  positionalInsertTargets,
   positionalMergeTarget,
   schemaAllowed,
   type Policy,
@@ -90,21 +90,24 @@ async function describeWriteTarget(
 /** INSERT/REPLACE/MERGE without a column list writes every column, hidden ones included. */
 async function assertPositionalWrite(sql: string, policy: Policy, adapter: DbAdapter, connection: string) {
   for (const tokens of splitStatements(sql, adapter.engine)) {
-    const target = positionalInsertTarget(tokens) ?? positionalMergeTarget(tokens);
-    if (!target) continue;
-    const d = await describeWriteTarget(adapter, policy, target);
-    const cols = (d.columns as Array<{ name: string }> | undefined) ?? [];
-    const hit = cols.find((c) =>
-      columnHidden(policy, {
-        schema: d.schema as string,
-        table: String(d.name ?? target.table),
-        column: lastPart(c.name),
-      }),
-    );
-    if (hit) {
-      throw new Error(
-        `${target.table} has hidden columns; list the columns you write (INSERT INTO ${target.table} (a, b) …) on connection "${connection}"`,
+    const targets = [...positionalInsertTargets(tokens)];
+    const merge = positionalMergeTarget(tokens);
+    if (merge) targets.push(merge);
+    for (const target of targets) {
+      const d = await describeWriteTarget(adapter, policy, target);
+      const cols = (d.columns as Array<{ name: string }> | undefined) ?? [];
+      const hit = cols.find((c) =>
+        columnHidden(policy, {
+          schema: d.schema as string,
+          table: String(d.name ?? target.table),
+          column: lastPart(c.name),
+        }),
       );
+      if (hit) {
+        throw new Error(
+          `${target.table} has hidden columns; list the columns you write (INSERT INTO ${target.table} (a, b) …) on connection "${connection}"`,
+        );
+      }
     }
   }
 }
@@ -259,6 +262,12 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
             !columnHidden(policy, { schema, table, column: lastPart(c.name) }) &&
             !columnHidden(policy, { schema, table, column: c.name.split(".")[0]! }),
         );
+        // A STRUCT parent's type string lists its children: mask it when a child is hidden.
+        for (const c of visible as Array<{ name: string; type?: string }>) {
+          if (typeof c.type === "string" && c.type.includes("<") && mentionsHidden(policy, c.type, table)) {
+            c.type = "STRUCT<…hidden fields…>";
+          }
+        }
         const hidden = d.columns.length - visible.length;
         const redacted = await redactDescription(policy, d, table, ctx.adapterFor(connection));
         return {
