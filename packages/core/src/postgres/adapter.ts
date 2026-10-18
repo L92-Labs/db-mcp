@@ -252,7 +252,9 @@ export function createPostgresAdapter(
         .flatMap(([, v]) =>
           typeof v === "string" ? [v] : Array.isArray(v) ? v.filter((x) => typeof x === "string") : [],
         )
-        .join("\n");
+        .join("\n")
+        // String constants ('api_token'::text) are not column references.
+        .replace(/'(?:[^']|'')*'/g, "''");
       const alias = String(node.Alias ?? table);
       const wholeRow = new RegExp(
         `(?:^|[^A-Za-z0-9_$"])(?:"${escapeRe(alias.replace(/"/g, '""'))}"|${escapeRe(alias)})\\.\\*`,

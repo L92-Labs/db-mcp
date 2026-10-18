@@ -279,3 +279,24 @@ describe.skipIf(!url)("mysql review fixes (live)", () => {
     await expect(dispatchTool("sql_query", { sql: "SHOW DATABASES" }, guarded)).rejects.toThrow(/disabled/);
   });
 });
+
+describe.skipIf(!url)("mysql review fixes round 2 (live)", () => {
+  it("a database created after the first query is still outside the allowlist", async () => {
+    const guarded = ctxFor("read_write", { MYSQL_SCHEMAS: "shop" });
+    await dispatchTool("sql_query", { sql: "SELECT 1 AS warm" }, guarded);
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS later_db");
+    await root.query("CREATE TABLE IF NOT EXISTS later_db.t (id INT)");
+    await root.query("INSERT INTO later_db.t VALUES (1)");
+    try {
+      await expect(dispatchTool("sql_execute", { sql: "DELETE FROM later_db.t" }, guarded)).rejects.toThrow(
+        /allowlist/,
+      );
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM later_db.t")) as any;
+      expect(Number(n)).toBe(1);
+    } finally {
+      await root.query("DROP DATABASE later_db");
+      await root.end();
+    }
+  });
+});

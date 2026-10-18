@@ -344,3 +344,38 @@ describe.skipIf(!url)("postgres review fixes (live)", () => {
     expect(r.rows).toEqual([{ api_token: "x" }]);
   });
 });
+
+describe.skipIf(!url)("postgres review fixes round 2 (live)", () => {
+  const admin = url ? ctxFor("admin") : (undefined as never);
+  const guarded = url
+    ? ctxFor("read_write", { DATABASE_SCHEMAS: "shop", DATABASE_HIDDEN_COLUMNS: "customers.api_token" })
+    : (undefined as never);
+
+  it("unqualified positional INSERT resolves through the allowlisted search_path", async () => {
+    await dispatchTool(
+      "sql_execute",
+      { sql: "CREATE TABLE IF NOT EXISTS public.customers (id int, email text)" },
+      admin,
+    );
+    try {
+      await expect(
+        dispatchTool(
+          "sql_execute",
+          { sql: "INSERT INTO customers VALUES (99, 'x@y.z', 'X', 'tok', now())", dry_run: true },
+          guarded,
+        ),
+      ).rejects.toThrow(/list the columns/);
+    } finally {
+      await dispatchTool("sql_execute", { sql: "DROP TABLE public.customers" }, admin);
+    }
+  });
+
+  it("string constants in the plan are not column references", async () => {
+    const r = (await dispatchTool(
+      "sql_query",
+      { sql: "SELECT 'api_token' AS label, email FROM shop.customers LIMIT 1" },
+      guarded,
+    )) as any;
+    expect(r.rows[0].label).toBe("api_token");
+  });
+});

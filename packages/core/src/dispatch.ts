@@ -67,12 +67,32 @@ function assertSchema(policy: Policy | null, schema: string | undefined | null, 
   }
 }
 
+/**
+ * Resolve the table a write will hit. Postgres pins search_path to the allowlist while
+ * executing, so an unqualified name must be looked up in those schemas, in that order.
+ */
+async function describeWriteTarget(
+  adapter: DbAdapter,
+  policy: Policy,
+  target: { schema?: string; table: string },
+): Promise<Record<string, unknown>> {
+  if (adapter.engine !== "postgres" || target.schema || !policy.schemas) return adapter.describeTable(target);
+  for (const schema of policy.schemas) {
+    try {
+      return await adapter.describeTable({ schema, table: target.table });
+    } catch (error) {
+      if (!/not found/.test(error instanceof Error ? error.message : "")) throw error;
+    }
+  }
+  throw new Error(`table or view not found in allowed schemas: ${target.table}`);
+}
+
 /** INSERT/REPLACE/MERGE without a column list writes every column, hidden ones included. */
 async function assertPositionalWrite(sql: string, policy: Policy, adapter: DbAdapter, connection: string) {
   for (const tokens of splitStatements(sql, adapter.engine)) {
     const target = positionalInsertTarget(tokens) ?? positionalMergeTarget(tokens);
     if (!target) continue;
-    const d = await adapter.describeTable(target);
+    const d = await describeWriteTarget(adapter, policy, target);
     const cols = (d.columns as Array<{ name: string }> | undefined) ?? [];
     const hit = cols.find((c) =>
       columnHidden(policy, {

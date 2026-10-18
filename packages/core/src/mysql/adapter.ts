@@ -94,7 +94,6 @@ export function createMySqlAdapter(
 ): DbAdapter {
   const policy = policyFor(connection);
   let timeoutVar: "max_execution_time" | "max_statement_time" | null | undefined;
-  let knownSchemas: Set<string> | undefined;
 
   async function withClient<T>(fn: (client: MySqlClient, discard: () => void) => Promise<T>): Promise<T> {
     const lease = await opts.connect();
@@ -252,15 +251,13 @@ export function createMySqlAdapter(
     return inTransaction("read", 15_000, null, (client) => metaQuery<R>(client, sql, values));
   }
 
+  /** Fetched per statement: a cached list would miss databases created later. */
   async function schemaSet(client: MySqlClient): Promise<Set<string>> {
-    if (!knownSchemas) {
-      const rows = await metaQuery<{ name: string }>(
-        client,
-        "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA",
-      );
-      knownSchemas = new Set(rows.map((r) => r.name.toLowerCase()));
-    }
-    return knownSchemas;
+    const rows = await metaQuery<{ name: string }>(
+      client,
+      "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA",
+    );
+    return new Set(rows.map((r) => r.name.toLowerCase()));
   }
 
   /** Before running: default database and every schema-qualified name must be allowed. */
