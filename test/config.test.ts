@@ -46,7 +46,7 @@ describe("loadRuntimeConfig", () => {
     expect(() => loadRuntimeConfig({})).toThrow(/Configure/);
     expect(() => loadRuntimeConfig({ DATABASE_URL: "x", DB_ACCESS: "maybe" })).toThrow(/access must be/);
     expect(() => loadRuntimeConfig({ DATABASE_URL: "x", DB_MAX_ROWS: "0" })).toThrow(/DB_MAX_ROWS/);
-    expect(() => loadRuntimeConfig({ DB_CONNECTIONS_JSON: '{"a":{"engine":"mysql","url":"x"}}' })).toThrow(
+    expect(() => loadRuntimeConfig({ DB_CONNECTIONS_JSON: '{"a":{"engine":"oracle","url":"x"}}' })).toThrow(
       /unknown engine/,
     );
     expect(() =>

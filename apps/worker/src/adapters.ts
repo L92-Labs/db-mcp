@@ -1,32 +1,53 @@
+import mysql from "mysql2/promise";
 import pg from "pg";
 import {
   createBigQueryAdapter,
+  createMySqlAdapter,
   createPostgresAdapter,
+  mysqlClientOptions,
   pgClientConfig,
   type AdapterFactory,
+  type ConnectionConfig,
 } from "@db-mcp/core";
 import { isHyperdrive, type WorkerEnv } from "./env.js";
 
-/** Workers: a fresh pg.Client per operation (Hyperdrive pools for us); BigQuery over fetch. */
+function hyperdriveFor(
+  env: WorkerEnv,
+  connection: ConnectionConfig & { hyperdrive?: string },
+): Hyperdrive | undefined {
+  if (!connection.hyperdrive) return undefined;
+  const binding = env[connection.hyperdrive];
+  if (!isHyperdrive(binding)) {
+    throw new Error(`connection "${connection.name}": no Hyperdrive binding named ${connection.hyperdrive}`);
+  }
+  return binding;
+}
+
+/** Workers: a fresh client per operation (Hyperdrive pools for us); BigQuery over fetch. */
 export function workerAdapterFactory(env: WorkerEnv): AdapterFactory {
   return (connection, config) => {
     if (connection.engine === "bigquery") return createBigQueryAdapter(connection);
 
-    let connectionString = connection.url;
-    if (connection.hyperdrive) {
-      const binding = env[connection.hyperdrive];
-      if (!isHyperdrive(binding)) {
-        throw new Error(
-          `connection "${connection.name}": no Hyperdrive binding named ${connection.hyperdrive}`,
-        );
-      }
-      connectionString = binding.connectionString;
+    const hd = hyperdriveFor(env, connection);
+
+    if (connection.engine === "mysql") {
+      const target = hd
+        ? { host: hd.host, port: hd.port, user: hd.user, password: hd.password, database: hd.database }
+        : { uri: connection.url! };
+      const options = mysqlClientOptions(connection, target, { disableEval: true });
+      return createMySqlAdapter(connection, {
+        async connect() {
+          const conn = await mysql.createConnection(options);
+          return { client: conn, release: () => conn.end().catch(() => undefined) };
+        },
+      });
     }
+
+    const connectionString = hd?.connectionString ?? connection.url;
     if (!connectionString) throw new Error(`connection "${connection.name}" has no url or hyperdrive`);
     const clientConfig = pgClientConfig(connection, connectionString, {
       queryTimeoutMs: config.statementTimeoutMs + 5_000,
     });
-
     return createPostgresAdapter(connection, {
       async connect() {
         const client = new pg.Client(clientConfig);

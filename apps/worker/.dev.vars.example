@@ -1,6 +1,10 @@
 MCP_BEARER_TOKEN=dev-token-change-me
 DB_ACCESS=read_only
-# DB_CONNECTIONS_JSON={"main":{"engine":"postgres","hyperdrive":"HYPERDRIVE","access":"read_write"}}
+# AUTH_MODE=oauth
+# OAUTH_LOGIN=password
+# OAUTH_PASSWORD=a-long-random-password-here
+# DB_CONNECTIONS_JSON={"main":{"engine":"postgres","hyperdrive":"HYPERDRIVE","access":"read_write","schemas":["public"],"hidden_columns":["password","*token*"]}}
+# MYSQL_HYPERDRIVE=HYPERDRIVE_MYSQL
 # BIGQUERY_PROJECT_ID=my-project
 # BIGQUERY_LOCATION=US
 # BIGQUERY_CREDENTIALS_JSON=base64-or-raw-service-account-json

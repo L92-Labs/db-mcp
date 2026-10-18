@@ -1,4 +1,5 @@
-import { classAllowed, maxClass } from "../sql/classify.js";
+import { columnHidden, policyFor, schemaAllowed } from "../policy.js";
+import { classAllowed, maxClass, qualifierTokens, splitStatements } from "../sql/classify.js";
 import type {
   BigQueryConnection,
   DbAdapter,
@@ -95,6 +96,7 @@ export function createBigQueryAdapter(
       ? serviceAccountTokenProvider(parseServiceAccount(connection.credentialsJson), fetchImpl)
       : staticTokenProvider(connection.accessToken!));
   const project = connection.projectId;
+  const policy = policyFor(connection);
 
   async function api<T>(
     method: string,
@@ -220,8 +222,40 @@ export function createBigQueryAdapter(
     };
   }
 
+  /** Schema/column policy from the dry run: referenced datasets + output columns, plus qualifiers in the SQL. */
+  async function enforcePolicy(sql: string, dry: DryRunJob): Promise<void> {
+    if (!policy) return;
+    const q = dry.statistics?.query;
+    for (const t of q?.referencedTables ?? []) {
+      if (!schemaAllowed(policy, `${t.projectId}.${t.datasetId}`)) {
+        throw new Error(
+          `${t.datasetId}.${t.tableId} is outside the dataset allowlist of connection "${connection.name}"`,
+        );
+      }
+    }
+    if (policy.schemas) {
+      const known = new Set((await datasetNames()).map((d) => d.toLowerCase()));
+      for (const qualifier of splitStatements(sql, "bigquery").flatMap(qualifierTokens)) {
+        if (known.has(qualifier.toLowerCase()) && !schemaAllowed(policy, qualifier)) {
+          throw new Error(`dataset ${qualifier} is outside the allowlist of connection "${connection.name}"`);
+        }
+      }
+    }
+    for (const f of flattenFields(q?.schema?.fields ?? [])) {
+      if (f.name.split(".").some((part) => columnHidden(policy, { column: part }))) {
+        throw new Error(`result column ${f.name} is hidden on connection "${connection.name}"`);
+      }
+    }
+  }
+
+  let datasetCache: string[] | undefined;
+  async function datasetNames(): Promise<string[]> {
+    datasetCache ??= (await listDatasets(true)).map((d) => String(d.name));
+    return datasetCache;
+  }
+
   async function run(
-    input: Pick<RunInput, "sql" | "params" | "maxRows" | "timeoutMs" | "allow" | "classified">,
+    input: Pick<RunInput, "sql" | "params" | "maxRows" | "timeoutMs" | "allow" | "classified" | "dryRun">,
   ): Promise<QueryResult> {
     const started = Date.now();
     // Dry run first: free, validates SQL, and gives the authoritative statementType.
@@ -232,6 +266,26 @@ export function createBigQueryAdapter(
       throw new Error(
         `BigQuery dry run reports statementType ${statementType ?? "unknown"} (${cls}); this call allows ${input.allow} only`,
       );
+    }
+    await enforcePolicy(input.sql, dry);
+    if (input.dryRun) {
+      const q = dry.statistics?.query;
+      const bytes = q?.totalBytesProcessed ?? dry.statistics?.totalBytesProcessed;
+      return {
+        columns: (q?.schema?.fields ?? []).map((f) => ({ name: f.name, type: bqTypeLabel(f) })),
+        rows: [],
+        row_count: 0,
+        truncated: false,
+        affected_rows: null,
+        command: statementType,
+        statement_class: cls,
+        bytes_processed: bytes === undefined ? null : Number(bytes),
+        referenced_tables: (q?.referencedTables ?? []).map(
+          (t) => `${t.projectId}.${t.datasetId}.${t.tableId}`,
+        ),
+        note: "BigQuery dry run: validated and estimated only; nothing executed, affected rows unknown",
+        duration_ms: Date.now() - started,
+      };
     }
     const res = await query(input.sql, input.params, input.maxRows, input.timeoutMs);
     return shape(res, input.maxRows, cls, started, statementType);
@@ -377,16 +431,38 @@ export function createBigQueryAdapter(
 
     async sampleTable(ref, limit, timeoutMs) {
       const started = Date.now();
-      const t = await getTable(ref);
       const path = tablePath(ref);
-      const fields = t.schema?.fields ?? [];
+      if (!schemaAllowed(policy, `${path.projectId}.${path.datasetId}`)) {
+        throw new Error(
+          `dataset ${path.datasetId} is outside the allowlist of connection "${connection.name}"`,
+        );
+      }
+      const t = await getTable(ref);
+      const allFields = t.schema?.fields ?? [];
+      // Drop any top-level field that is, or contains, a hidden column.
+      const fields = allFields.filter(
+        (f) =>
+          !flattenFields([f]).some((x) =>
+            x.name
+              .split(".")
+              .some((part) =>
+                columnHidden(policy, { schema: path.datasetId, table: path.tableId, column: part }),
+              ),
+          ),
+      );
+      if (fields.length === 0) throw new Error(`every column of ${path.datasetId}.${path.tableId} is hidden`);
+      const restricted = fields.length < allFields.length;
       if (String(t.type ?? "TABLE") === "TABLE") {
         // tabledata.list is free (no bytes billed), unlike SELECT * … LIMIT.
         const data = await api<{ rows?: Array<{ f?: Array<{ v: unknown }> }>; totalRows?: string }>(
           "GET",
           `/projects/${path.projectId}/datasets/${path.datasetId}/tables/${path.tableId}/data`,
           undefined,
-          { maxResults: String(limit), "formatOptions.useInt64Timestamp": "true" },
+          {
+            maxResults: String(limit),
+            "formatOptions.useInt64Timestamp": "true",
+            selectedFields: restricted ? fields.map((f) => f.name).join(",") : undefined,
+          },
         );
         const rows = bqRowsToObjects(fields, data.rows).slice(0, limit);
         const total = data.totalRows === undefined ? rows.length : Number(data.totalRows);
@@ -401,7 +477,8 @@ export function createBigQueryAdapter(
           duration_ms: Date.now() - started,
         };
       }
-      const sql = `SELECT * FROM ${quoteBq(`${path.projectId}.${path.datasetId}.${path.tableId}`)} LIMIT ${Math.floor(limit)}`;
+      const select = restricted ? fields.map((f) => quoteBq(f.name)).join(", ") : "*";
+      const sql = `SELECT ${select} FROM ${quoteBq(`${path.projectId}.${path.datasetId}.${path.tableId}`)} LIMIT ${Math.floor(limit)}`;
       return run({ sql, maxRows: limit, timeoutMs, allow: "read", classified: "read" });
     },
 

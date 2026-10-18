@@ -17,8 +17,8 @@ import {
 const url = process.env.TEST_DATABASE_URL;
 const pools: pg.Pool[] = [];
 
-function ctxFor(access: string) {
-  const config = loadRuntimeConfig({ DATABASE_URL: url!, DB_ACCESS: access, DB_MAX_ROWS: "100" });
+function ctxFor(access: string, extra: Record<string, string> = {}) {
+  const config = loadRuntimeConfig({ DATABASE_URL: url!, DB_ACCESS: access, DB_MAX_ROWS: "100", ...extra });
   return createDispatchContext(config, (connection) => {
     const c = connection as PostgresConnection;
     const pool = new pg.Pool({ ...pgClientConfig(c, c.url!), max: 2 });
@@ -37,9 +37,9 @@ afterAll(async () => {
 });
 
 describe.skipIf(!url)("postgres adapter (live)", () => {
-  const ro = ctxFor("read_only");
-  const rw = ctxFor("read_write");
-  const admin = ctxFor("admin");
+  const ro = url ? ctxFor("read_only") : (undefined as never);
+  const rw = url ? ctxFor("read_write") : (undefined as never);
+  const admin = url ? ctxFor("admin") : (undefined as never);
 
   it("connection_info", async () => {
     const info = (await dispatchTool("connection_info", {}, ro)) as Record<string, unknown>;
@@ -197,5 +197,110 @@ describe.skipIf(!url)("postgres adapter (live)", () => {
       ro,
     )) as Record<string, any>;
     expect(e.plan.Plan["Node Type"]).toBeDefined();
+  });
+});
+
+describe.skipIf(!url)("postgres dry run, policy, budget (live)", () => {
+  const rw = url ? ctxFor("read_write") : (undefined as never);
+  const admin = url ? ctxFor("admin") : (undefined as never);
+  const guarded = url
+    ? ctxFor("read_write", { DATABASE_SCHEMAS: "shop", DATABASE_HIDDEN_COLUMNS: "api_token" })
+    : (undefined as never);
+
+  const count = async () =>
+    ((await dispatchTool("sql_query", { sql: "SELECT count(*)::int AS n FROM shop.orders" }, rw)) as any)
+      .rows[0].n;
+
+  it("dry_run reports affected rows and rolls back", async () => {
+    const before = await count();
+    const r = (await dispatchTool(
+      "sql_execute",
+      { sql: "DELETE FROM shop.orders WHERE status = 'paid'", dry_run: true },
+      rw,
+    )) as any;
+    expect(r).toMatchObject({ dry_run: true, rolled_back: true, affected_rows: 2, command: "DELETE" });
+    expect(await count()).toBe(before);
+  });
+
+  it("admin dry_run rolls back DDL and refuses transaction control", async () => {
+    await dispatchTool(
+      "sql_execute",
+      { sql: "CREATE TABLE shop.tmp_dry (a int); INSERT INTO shop.tmp_dry VALUES (1)", dry_run: true },
+      admin,
+    );
+    const t = (await dispatchTool("tables_list", { schema: "shop", pattern: "tmp_dry" }, admin)) as any;
+    expect(t.count).toBe(0);
+    await expect(
+      dispatchTool("sql_execute", { sql: "COMMIT; DROP TABLE shop.orders", dry_run: true }, admin),
+    ).rejects.toThrow(/cannot contain COMMIT/);
+  });
+
+  it("schema allowlist filters metadata and refuses other schemas in SQL", async () => {
+    const schemas = (await dispatchTool("schemas_list", {}, guarded)) as any;
+    expect(schemas.schemas.map((s: any) => s.name)).toEqual(["shop"]);
+    const tables = (await dispatchTool("tables_list", {}, guarded)) as any;
+    expect(tables.tables.every((t: any) => t.schema === "shop")).toBe(true);
+    await expect(dispatchTool("table_describe", { table: "secret.vault" }, guarded)).rejects.toThrow(
+      /allowlist/,
+    );
+    await expect(dispatchTool("sql_query", { sql: "SELECT * FROM secret.vault" }, guarded)).rejects.toThrow(
+      /allowlist/,
+    );
+    await expect(
+      dispatchTool(
+        "sql_query",
+        { sql: "SELECT * FROM shop.orders o JOIN secret.vault v ON v.id = o.id" },
+        guarded,
+      ),
+    ).rejects.toThrow(/allowlist/);
+    // search_path is pinned to the allowlist, so an unqualified name cannot reach public/secret
+    const ok = (await dispatchTool("sql_query", { sql: "SELECT count(*) AS n FROM orders" }, guarded)) as any;
+    expect(ok.rows[0].n).toBe("3");
+    await expect(dispatchTool("sql_execute", { sql: "DELETE FROM secret.vault" }, guarded)).rejects.toThrow(
+      /allowlist/,
+    );
+  });
+
+  it("hidden columns: metadata, SELECT *, aliases, whole-row, sample", async () => {
+    const d = (await dispatchTool("table_describe", { table: "shop.customers" }, guarded)) as any;
+    expect(d.columns.map((c: any) => c.name)).not.toContain("api_token");
+    expect(d.hidden_columns).toBe(1);
+    await expect(dispatchTool("sql_query", { sql: "SELECT * FROM shop.customers" }, guarded)).rejects.toThrow(
+      /hidden/,
+    );
+    await expect(
+      dispatchTool("sql_query", { sql: "SELECT c.* FROM shop.customers c" }, guarded),
+    ).rejects.toThrow(/hidden/);
+    await expect(
+      dispatchTool("sql_query", { sql: "SELECT row_to_json(c) FROM shop.customers c" }, guarded),
+    ).rejects.toThrow(/hidden/);
+    await expect(
+      dispatchTool("sql_query", { sql: "SELECT api_token FROM shop.customers" }, guarded),
+    ).rejects.toThrow(/hidden/);
+    const ok = (await dispatchTool(
+      "sql_query",
+      { sql: "SELECT c.email AS e FROM shop.customers c" },
+      guarded,
+    )) as any;
+    expect(ok.row_count).toBe(2);
+    const s = (await dispatchTool("table_sample", { table: "shop.customers" }, guarded)) as any;
+    expect(s.columns.map((c: any) => c.name)).toEqual(["id", "email", "name", "created_at"]);
+    const cols = (await dispatchTool("columns_search", { pattern: "token" }, guarded)) as any;
+    expect(cols.count).toBe(0);
+    await expect(
+      dispatchTool("sql_execute", { sql: "CREATE TABLE shop.x (a int)" }, guarded),
+    ).rejects.toThrow(/disabled|admin/);
+  });
+
+  it("byte budget truncates big results", async () => {
+    const small = ctxFor("read_only", { DB_MAX_RESULT_BYTES: "2000", DB_MAX_CELL_CHARS: "20" });
+    const r = (await dispatchTool(
+      "sql_query",
+      { sql: "SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 100) g" },
+      small,
+    )) as any;
+    expect(r).toMatchObject({ truncated: true, truncated_by: "bytes" });
+    expect(r.rows[0].pad).toMatch(/…\[\+80 chars\]$/);
+    expect(r.row_count).toBeLessThan(100);
   });
 });

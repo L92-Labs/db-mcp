@@ -191,3 +191,115 @@ describe("service account auth", () => {
     expect(exchanges).toBe(1);
   });
 });
+
+describe("BigQuery policy and dry run", () => {
+  const guarded: BigQueryConnection = {
+    ...conn,
+    access: "read_write",
+    schemas: ["analytics"],
+    hiddenColumns: ["email"],
+  };
+
+  function fetchWith(dry: Record<string, unknown>, calls: Call[]): typeof fetch {
+    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({
+        method: init?.method ?? "GET",
+        url,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      const ok = (v: unknown) => new Response(JSON.stringify(v), { status: 200 });
+      if (url.endsWith("/projects/proj/jobs")) return ok({ statistics: { query: dry } });
+      if (url.includes("/projects/proj/datasets?")) {
+        return ok({
+          datasets: [
+            { datasetReference: { projectId: "proj", datasetId: "analytics" } },
+            { datasetReference: { projectId: "proj", datasetId: "hr" } },
+          ],
+        });
+      }
+      if (url.endsWith("/tables/users")) {
+        return ok({
+          type: "TABLE",
+          schema: {
+            fields: [
+              { name: "id", type: "INT64" },
+              { name: "email", type: "STRING" },
+            ],
+          },
+        });
+      }
+      if (url.includes("/tables/users/data")) return ok({ rows: [{ f: [{ v: "1" }] }], totalRows: "1" });
+      if (url.endsWith("/projects/proj/queries"))
+        return ok({ jobComplete: true, schema: { fields: [] }, rows: [] });
+      return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+  }
+
+  const run = (a: ReturnType<typeof createBigQueryAdapter>, sql: string, dryRun = false) =>
+    a.run({ sql, maxRows: 10, timeoutMs: 1000, allow: "write", classified: "write", dryRun });
+
+  it("dry_run never executes and reports the estimate", async () => {
+    const calls: Call[] = [];
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith(
+        {
+          statementType: "DELETE",
+          totalBytesProcessed: "10",
+          referencedTables: [{ projectId: "proj", datasetId: "analytics", tableId: "t" }],
+        },
+        calls,
+      ),
+    });
+    const r = await run(a, "DELETE FROM analytics.t WHERE true", true);
+    expect(r).toMatchObject({ command: "DELETE", bytes_processed: 10, affected_rows: null, row_count: 0 });
+    expect(calls.some((c) => c.url.endsWith("/queries"))).toBe(false);
+  });
+
+  it("refuses referenced tables outside the dataset allowlist", async () => {
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith(
+        {
+          statementType: "SELECT",
+          referencedTables: [{ projectId: "proj", datasetId: "hr", tableId: "salaries" }],
+        },
+        [],
+      ),
+    });
+    await expect(run(a, "SELECT * FROM hr.salaries")).rejects.toThrow(/allowlist/);
+  });
+
+  it("refuses qualifiers naming a forbidden dataset (e.g. DML targets)", async () => {
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith({ statementType: "INSERT", referencedTables: [] }, []),
+    });
+    await expect(run(a, "INSERT INTO `proj.hr.salaries` (a) VALUES (1)")).rejects.toThrow(/dataset hr/);
+  });
+
+  it("refuses hidden columns in the output schema", async () => {
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith(
+        {
+          statementType: "SELECT",
+          schema: {
+            fields: [
+              { name: "id", type: "INT64" },
+              { name: "EMAIL", type: "STRING" },
+            ],
+          },
+        },
+        [],
+      ),
+    });
+    await expect(run(a, "SELECT * FROM analytics.users")).rejects.toThrow(/hidden/);
+  });
+
+  it("table_sample selects only visible fields via tabledata.list", async () => {
+    const calls: Call[] = [];
+    const a = createBigQueryAdapter(guarded, { fetch: fetchWith({}, calls) });
+    const r = await a.sampleTable({ schema: "analytics", table: "users" }, 5, 1000);
+    expect(r.columns).toEqual([{ name: "id", type: "INT64" }]);
+    expect(calls.find((c) => c.url.includes("/users/data?"))!.url).toContain("selectedFields=id");
+    await expect(a.sampleTable({ schema: "hr", table: "users" }, 5, 1000)).rejects.toThrow(/allowlist/);
+  });
+});

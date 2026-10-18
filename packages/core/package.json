@@ -11,13 +11,16 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "mysql2": "^3.24.6",
     "pg": "^8.16.3",
     "pg-cursor": "^2.15.3",
     "zod": "^4.0.0"

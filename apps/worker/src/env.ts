@@ -1,22 +1,26 @@
 import type { EnvMap } from "@db-mcp/core";
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 
 export type WorkerEnv = {
   MCP_BEARER_TOKEN?: string;
   DB_CONNECTIONS_JSON?: string;
   DB_DEFAULT_CONNECTION?: string;
   DB_ACCESS?: string;
-  DB_MAX_ROWS?: string;
-  DB_STATEMENT_TIMEOUT_MS?: string;
   DATABASE_URL?: string;
-  DATABASE_ACCESS?: string;
-  DATABASE_SSL?: string;
+  MYSQL_URL?: string;
+  MYSQL_HYPERDRIVE?: string;
   BIGQUERY_PROJECT_ID?: string;
-  BIGQUERY_LOCATION?: string;
-  BIGQUERY_CREDENTIALS_JSON?: string;
-  BIGQUERY_ACCESS_TOKEN?: string;
-  BIGQUERY_DEFAULT_DATASET?: string;
-  BIGQUERY_MAX_BYTES_BILLED?: string;
-  BIGQUERY_ACCESS?: string;
+  /** "bearer" (default) or "oauth" */
+  AUTH_MODE?: string;
+  /** "github" or "password" */
+  OAUTH_LOGIN?: string;
+  OAUTH_PASSWORD?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  /** Comma-separated GitHub logins allowed to sign in. */
+  OAUTH_ALLOWED_USERS?: string;
+  OAUTH_KV?: KVNamespace;
+  OAUTH_PROVIDER?: OAuthHelpers;
   HYPERDRIVE?: Hyperdrive;
   [binding: string]: unknown;
 };

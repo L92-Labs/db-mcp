@@ -13,7 +13,7 @@ import { nodeAdapterFactory } from "./adapters.js";
 
 export async function startStdio(config: RuntimeConfig): Promise<void> {
   const ctx = createDispatchContext(config, nodeAdapterFactory);
-  await buildMcpServer(ctx).connect(new StdioServerTransport());
+  await buildMcpServer(ctx, { principal: "stdio" }).connect(new StdioServerTransport());
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -81,7 +81,7 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse, ctx: Dispat
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
   });
-  const mcp = buildMcpServer(ctx);
+  const mcp = buildMcpServer(ctx, { principal: "bearer" });
   res.on("close", () => {
     void transport.close();
     void mcp.close();

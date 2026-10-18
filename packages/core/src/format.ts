@@ -51,3 +51,45 @@ export function splitQualified(
   const idx = t.lastIndexOf(".");
   return { schema: t.slice(0, idx), table: t.slice(idx + 1) };
 }
+
+export type LimitStats = { cellsTruncated: number; rowsDropped: number };
+
+/**
+ * Keep a result inside the response budget: long strings / big JSON cells are cut to
+ * `maxCellChars`, then trailing rows are dropped until the rows fit in `maxBytes`.
+ */
+export function limitRows(
+  rows: Record<string, unknown>[],
+  maxBytes: number,
+  maxCellChars: number,
+): { rows: Record<string, unknown>[]; stats: LimitStats } {
+  const stats: LimitStats = { cellsTruncated: 0, rowsDropped: 0 };
+  const cut = (v: unknown): unknown => {
+    if (typeof v === "string") {
+      if (v.length <= maxCellChars) return v;
+      stats.cellsTruncated++;
+      return `${v.slice(0, maxCellChars)}…[+${v.length - maxCellChars} chars]`;
+    }
+    if (v !== null && typeof v === "object") {
+      const json = JSON.stringify(v);
+      if (json.length <= maxCellChars) return v;
+      stats.cellsTruncated++;
+      return `${json.slice(0, maxCellChars)}…[+${json.length - maxCellChars} chars]`;
+    }
+    return v;
+  };
+  const out: Record<string, unknown>[] = [];
+  let size = 2;
+  for (const row of rows) {
+    const next: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(row)) next[k] = cut(v);
+    const bytes = new TextEncoder().encode(JSON.stringify(next)).length + 1;
+    if (size + bytes > maxBytes && out.length > 0) {
+      stats.rowsDropped = rows.length - out.length;
+      break;
+    }
+    size += bytes;
+    out.push(next);
+  }
+  return { rows: out, stats };
+}

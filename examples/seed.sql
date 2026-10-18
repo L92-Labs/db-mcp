@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS shop.customers (
   id         bigserial PRIMARY KEY,
   email      text NOT NULL UNIQUE,
   name       text,
+  api_token  text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE shop.customers IS 'People who bought something';
@@ -24,9 +25,9 @@ CREATE OR REPLACE VIEW shop.order_totals AS
   FROM shop.customers c LEFT JOIN shop.orders o ON o.customer_id = c.id
   GROUP BY c.email;
 
-INSERT INTO shop.customers (email, name, created_at) VALUES
-  ('ada@example.com', 'Ada', '2024-01-02 03:04:05+00'),
-  ('linus@example.com', 'Linus', '2024-02-03 04:05:06+00')
+INSERT INTO shop.customers (email, name, api_token, created_at) VALUES
+  ('ada@example.com', 'Ada', 'tok_ada_secret', '2024-01-02 03:04:05+00'),
+  ('linus@example.com', 'Linus', 'tok_linus_secret', '2024-02-03 04:05:06+00')
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO shop.orders (customer_id, total_cents, status, placed_on, meta)
@@ -38,3 +39,8 @@ FROM (VALUES
 ) AS v(email, total, status, placed, meta)
 JOIN shop.customers c ON c.email = v.email
 WHERE NOT EXISTS (SELECT 1 FROM shop.orders);
+
+-- Outside the demo allowlist: used to test schemas / hidden_columns policies.
+CREATE SCHEMA IF NOT EXISTS secret;
+CREATE TABLE IF NOT EXISTS secret.vault (id int PRIMARY KEY, secret text NOT NULL);
+INSERT INTO secret.vault VALUES (1, 'launch codes') ON CONFLICT DO NOTHING;

@@ -10,3 +10,6 @@ export * from "./postgres/adapter.js";
 export * from "./bigquery/adapter.js";
 export * from "./bigquery/auth.js";
 export * from "./bigquery/values.js";
+export * from "./policy.js";
+export * from "./audit.js";
+export * from "./mysql/adapter.js";

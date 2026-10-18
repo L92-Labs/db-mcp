@@ -1,7 +1,9 @@
 import type {
   AccessLevel,
+  AuditMode,
   BigQueryConnection,
   ConnectionConfig,
+  MySqlConnection,
   PostgresConnection,
   RuntimeConfig,
 } from "./types.js";
@@ -78,20 +80,53 @@ type RawConnection = {
   defaultDataset?: string;
   max_bytes_billed?: string | number;
   maxBytesBilled?: string | number;
+  schemas?: string[] | string;
+  hidden_columns?: string[] | string;
+  hiddenColumns?: string[] | string;
 };
+
+function parseList(value: string[] | string | undefined, name: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  const out = list.map((v) => {
+    if (typeof v !== "string") throw new Error(`${name} must be a list of strings`);
+    return v.trim();
+  });
+  const filtered = out.filter(Boolean);
+  return filtered.length > 0 ? filtered : undefined;
+}
 
 function normalizeConnection(name: string, raw: RawConnection, defaultAccess: AccessLevel): ConnectionConfig {
   const engine = (raw.engine ?? raw.type ?? "").trim().toLowerCase();
   const access = parseAccess(raw.access, defaultAccess);
   const description = raw.description?.trim() || undefined;
+  const policy = {
+    schemas: parseList(raw.schemas, `connection "${name}" schemas`),
+    hiddenColumns: parseList(raw.hidden_columns ?? raw.hiddenColumns, `connection "${name}" hidden_columns`),
+  };
 
-  if (engine === "postgres" || engine === "postgresql" || engine === "pg") {
+  const sqlEngine =
+    engine === "postgres" || engine === "postgresql" || engine === "pg"
+      ? "postgres"
+      : engine === "mysql" || engine === "mariadb"
+        ? "mysql"
+        : null;
+  if (sqlEngine) {
     const url = (raw.url ?? raw.connection_string)?.trim() || undefined;
     const hyperdrive = raw.hyperdrive?.trim() || undefined;
     if (!url && !hyperdrive) {
-      throw new Error(`connection "${name}" (postgres) requires url or hyperdrive`);
+      throw new Error(`connection "${name}" (${sqlEngine}) requires url or hyperdrive`);
     }
-    return { name, engine: "postgres", access, description, url, hyperdrive, ssl: parseSsl(raw.ssl) };
+    return {
+      name,
+      engine: sqlEngine,
+      access,
+      description,
+      ...policy,
+      url,
+      hyperdrive,
+      ssl: parseSsl(raw.ssl),
+    };
   }
 
   if (engine === "bigquery" || engine === "bq") {
@@ -110,6 +145,7 @@ function normalizeConnection(name: string, raw: RawConnection, defaultAccess: Ac
       engine: "bigquery",
       access,
       description,
+      ...policy,
       projectId,
       location: raw.location?.trim() || undefined,
       credentialsJson,
@@ -119,7 +155,7 @@ function normalizeConnection(name: string, raw: RawConnection, defaultAccess: Ac
     };
   }
 
-  throw new Error(`connection "${name}" has unknown engine "${engine}" (use postgres or bigquery)`);
+  throw new Error(`connection "${name}" has unknown engine "${engine}" (use postgres, mysql or bigquery)`);
 }
 
 function loadFromJson(env: EnvMap, defaultAccess: AccessLevel): Record<string, ConnectionConfig> | null {
@@ -156,6 +192,25 @@ function loadShorthand(env: EnvMap, defaultAccess: AccessLevel): Record<string, 
         hyperdrive: url ? undefined : hyperdrive,
         ssl: env.DATABASE_SSL,
         access: env.DATABASE_ACCESS,
+        schemas: env.DATABASE_SCHEMAS,
+        hidden_columns: env.DATABASE_HIDDEN_COLUMNS,
+      },
+      defaultAccess,
+    );
+  }
+  const mysqlUrl = env.MYSQL_URL?.trim();
+  const mysqlHyperdrive = env.MYSQL_HYPERDRIVE?.trim();
+  if (mysqlUrl || mysqlHyperdrive) {
+    out.mysql = normalizeConnection(
+      "mysql",
+      {
+        engine: "mysql",
+        url: mysqlUrl,
+        hyperdrive: mysqlUrl ? undefined : mysqlHyperdrive,
+        ssl: env.MYSQL_SSL,
+        access: env.MYSQL_ACCESS,
+        schemas: env.MYSQL_SCHEMAS,
+        hidden_columns: env.MYSQL_HIDDEN_COLUMNS,
       },
       defaultAccess,
     );
@@ -172,6 +227,8 @@ function loadShorthand(env: EnvMap, defaultAccess: AccessLevel): Record<string, 
         default_dataset: env.BIGQUERY_DEFAULT_DATASET,
         max_bytes_billed: env.BIGQUERY_MAX_BYTES_BILLED,
         access: env.BIGQUERY_ACCESS,
+        schemas: env.BIGQUERY_DATASETS,
+        hidden_columns: env.BIGQUERY_HIDDEN_COLUMNS,
       },
       defaultAccess,
     );
@@ -186,8 +243,16 @@ export function loadRuntimeConfig(
   const connections = loadFromJson(env, defaultAccess) ?? loadShorthand(env, defaultAccess);
   if (!connections) {
     throw new Error(
-      "Configure DB_CONNECTIONS_JSON, DATABASE_URL (or a Hyperdrive binding) or BIGQUERY_PROJECT_ID. See .env.example",
+      "Configure DB_CONNECTIONS_JSON, DATABASE_URL (or a Hyperdrive binding), MYSQL_URL or BIGQUERY_PROJECT_ID. See .env.example",
     );
+  }
+
+  // DB_HIDDEN_COLUMNS applies to every connection, on top of its own hidden_columns.
+  const globalHidden = parseList(env.DB_HIDDEN_COLUMNS, "DB_HIDDEN_COLUMNS");
+  if (globalHidden) {
+    for (const c of Object.values(connections)) {
+      c.hiddenColumns = [...new Set([...(c.hiddenColumns ?? []), ...globalHidden])];
+    }
   }
 
   const names = Object.keys(connections);
@@ -207,8 +272,35 @@ export function loadRuntimeConfig(
       100,
       600_000,
     ),
+    maxResultBytes: parseIntInRange(
+      env.DB_MAX_RESULT_BYTES,
+      "DB_MAX_RESULT_BYTES",
+      100_000,
+      1_000,
+      50_000_000,
+    ),
+    maxCellChars: parseIntInRange(env.DB_MAX_CELL_CHARS, "DB_MAX_CELL_CHARS", 2_000, 16, 10_000_000),
+    audit: parseAudit(env.DB_AUDIT_LOG),
     mcpBearerToken: env.MCP_BEARER_TOKEN?.trim() || undefined,
   };
+}
+
+function parseAudit(value: string | undefined): AuditMode {
+  const v = (value ?? "meta").trim().toLowerCase();
+  if (v === "off" || v === "meta" || v === "sql") return v;
+  if (["0", "false", "no", "none"].includes(v)) return "off";
+  throw new Error(`DB_AUDIT_LOG must be off, meta or sql, got: ${value}`);
+}
+
+const ACCESS_RANK: Record<AccessLevel, number> = { read_only: 0, read_write: 1, admin: 2 };
+
+/** Lower every connection to at most `max` (e.g. an OAuth token without db:write). */
+export function capAccess(config: RuntimeConfig, max: AccessLevel): RuntimeConfig {
+  const connections: Record<string, ConnectionConfig> = {};
+  for (const [name, c] of Object.entries(config.connections)) {
+    connections[name] = ACCESS_RANK[c.access] > ACCESS_RANK[max] ? { ...c, access: max } : c;
+  }
+  return { ...config, connections };
 }
 
 export function resolveConnection(config: RuntimeConfig, name?: string): ConnectionConfig {
@@ -224,4 +316,4 @@ export function anyWritable(config: RuntimeConfig): boolean {
   return Object.values(config.connections).some((c) => c.access !== "read_only");
 }
 
-export type { BigQueryConnection, PostgresConnection };
+export type { BigQueryConnection, MySqlConnection, PostgresConnection };
