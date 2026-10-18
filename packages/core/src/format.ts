@@ -51,3 +51,55 @@ export function splitQualified(
   const idx = t.lastIndexOf(".");
   return { schema: t.slice(0, idx), table: t.slice(idx + 1) };
 }
+
+export type LimitStats = { cellsTruncated: number; rowsDropped: number };
+
+/**
+ * Keep a result inside the response budget: long strings / big JSON cells are cut to
+ * `maxCellChars`, then trailing rows are dropped until the rows fit in `maxBytes`.
+ */
+export function limitRows(
+  rows: Record<string, unknown>[],
+  maxBytes: number,
+  maxCellChars: number,
+): { rows: Record<string, unknown>[]; stats: LimitStats } {
+  const stats: LimitStats = { cellsTruncated: 0, rowsDropped: 0 };
+  const cut = (v: unknown, limit: number): [unknown, boolean] => {
+    const text = typeof v === "string" ? v : v !== null && typeof v === "object" ? JSON.stringify(v) : null;
+    if (text === null || text.length <= limit) return [v, false];
+    return [`${text.slice(0, limit)}…[+${text.length - limit} chars]`, true];
+  };
+  const shrink = (row: Record<string, unknown>, limit: number) => {
+    const next: Record<string, unknown> = {};
+    let cells = 0;
+    for (const [k, v] of Object.entries(row)) {
+      const [value, changed] = cut(v, limit);
+      next[k] = value;
+      if (changed) cells++;
+    }
+    return { next, cells, bytes: new TextEncoder().encode(JSON.stringify(next)).length + 1 };
+  };
+  const out: Record<string, unknown>[] = [];
+  let size = 2;
+  for (const row of rows) {
+    let { next, cells, bytes } = shrink(row, maxCellChars);
+    if (out.length === 0) {
+      // The first row must fit too: cut its cells harder before giving up on it.
+      for (
+        let limit = Math.floor(maxCellChars / 2);
+        size + bytes > maxBytes && limit >= 16;
+        limit = Math.floor(limit / 2)
+      ) {
+        ({ next, cells, bytes } = shrink(row, limit));
+      }
+    }
+    if (size + bytes > maxBytes) {
+      stats.rowsDropped = rows.length - out.length;
+      break;
+    }
+    stats.cellsTruncated += cells;
+    size += bytes;
+    out.push(next);
+  }
+  return { rows: out, stats };
+}

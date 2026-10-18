@@ -11,8 +11,10 @@
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
+    "@cloudflare/workers-oauth-provider": "^1.2.3",
     "@db-mcp/core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "mysql2": "^3.24.6",
     "pg": "^8.16.3"
   },
   "devDependencies": {

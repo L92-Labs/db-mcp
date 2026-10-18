@@ -1,7 +1,8 @@
 import pg from "pg";
 import Cursor from "pg-cursor";
 import { likePattern, toJsonValue } from "../format.js";
-import { classAllowed } from "../sql/classify.js";
+import { columnHidden, policyFor, schemaAllowed } from "../policy.js";
+import { classAllowed, classifySql, sideEffectCall } from "../sql/classify.js";
 import type {
   ColumnMeta,
   DbAdapter,
@@ -63,6 +64,22 @@ const SYSTEM_SCHEMA_SQL =
 const KIND_SQL = `CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned_table' WHEN 'v' THEN 'view'
   WHEN 'm' THEN 'materialized_view' WHEN 'f' THEN 'foreign_table' ELSE c.relkind::text END`;
 
+const TX_CONTROL = new Set([
+  "BEGIN",
+  "START",
+  "COMMIT",
+  "END",
+  "ROLLBACK",
+  "ABORT",
+  "SAVEPOINT",
+  "RELEASE",
+  "PREPARE",
+]);
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
@@ -82,32 +99,48 @@ type CursorRead = {
   command?: string;
 };
 
+/**
+ * Read through a cursor, keeping at most `limit` rows. `drain` reads the portal to the end
+ * (discarding extra rows) so writes report their CommandComplete row count.
+ */
 function readCursor(
   client: pg.ClientBase,
   text: string,
   values: unknown[],
   limit: number,
+  drain = false,
 ): Promise<CursorRead> {
   const cursor = client.query(new Cursor(text, values, { types: pgTypes }));
+  const batch = drain ? Math.max(limit, 500) : limit;
+  const kept: Record<string, unknown>[] = [];
   return new Promise((resolve, reject) => {
-    cursor.read(limit, (err, rows, result) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      cursor.close((closeErr) => {
-        if (closeErr) {
-          reject(closeErr);
+    const step = () => {
+      cursor.read(batch, (err, rows, result) => {
+        if (err) {
+          reject(err);
           return;
         }
-        resolve({
-          rows: rows as Record<string, unknown>[],
-          fields: result?.fields ?? [],
-          rowCount: result?.rowCount ?? null,
-          command: result?.command || undefined,
+        for (const r of rows as Record<string, unknown>[]) if (kept.length < limit) kept.push(r);
+        const finished = rows.length < batch;
+        if (drain && !finished) {
+          step();
+          return;
+        }
+        cursor.close((closeErr) => {
+          if (closeErr) {
+            reject(closeErr);
+            return;
+          }
+          resolve({
+            rows: kept,
+            fields: result?.fields ?? [],
+            rowCount: result?.rowCount ?? null,
+            command: result?.command || undefined,
+          });
         });
       });
-    });
+    };
+    step();
   });
 }
 
@@ -116,6 +149,7 @@ export function createPostgresAdapter(
   opts: { connect: PgConnector },
 ): DbAdapter {
   const typeNames = new Map<number, string>();
+  const policy = policyFor(connection);
 
   async function withClient<T>(fn: (client: pg.ClientBase) => Promise<T>): Promise<T> {
     const lease = await opts.connect();
@@ -132,7 +166,7 @@ export function createPostgresAdapter(
 
   /** BEGIN READ ONLY (+ local timeout) … ROLLBACK. Server-enforced: writes fail even if the classifier missed them. */
   async function inTransaction<T>(
-    mode: "read" | "write",
+    mode: "read" | "write" | "dry_run",
     timeoutMs: number,
     fn: (client: pg.ClientBase) => Promise<T>,
   ): Promise<T> {
@@ -141,7 +175,7 @@ export function createPostgresAdapter(
       try {
         await client.query(`SET LOCAL statement_timeout = ${Math.max(1, Math.floor(timeoutMs))}`);
         const out = await fn(client);
-        await client.query(mode === "read" ? "ROLLBACK" : "COMMIT");
+        await client.query(mode === "write" ? "COMMIT" : "ROLLBACK");
         return out;
       } catch (error) {
         await client.query("ROLLBACK").catch(() => undefined);
@@ -181,6 +215,95 @@ export function createPostgresAdapter(
     };
   }
 
+  /**
+   * Schema/column policy, checked on the real plan: restrict search_path, then
+   * EXPLAIN (VERBOSE) and inspect every scanned relation and the columns read from it.
+   */
+  async function enforcePolicy(client: pg.ClientBase, sql: string, values: unknown[]): Promise<void> {
+    if (!policy) return;
+    if (policy.schemas) {
+      await client.query(`SET LOCAL search_path = ${policy.schemas.map(quoteIdent).join(", ")}`);
+    }
+    const keyword = classifySql(sql, "postgres").statements[0]?.keyword;
+    if (keyword === "SHOW") return;
+    const res = await readCursor(client, `EXPLAIN (VERBOSE, FORMAT JSON) ${sql}`, values, 10);
+    const raw = res.rows[0]?.["QUERY PLAN"];
+    const root = (Array.isArray(raw) ? raw[0] : raw) as Record<string, unknown> | undefined;
+    const nodes: Record<string, unknown>[] = [];
+    const walk = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === "object") {
+        const node = v as Record<string, unknown>;
+        if ("Node Type" in node) nodes.push(node);
+        Object.values(node).forEach(walk);
+      }
+    };
+    walk(root);
+    const columnCache = new Map<string, string[]>(); // per statement: never stale
+
+    for (const node of nodes) {
+      const schema = node.Schema as string | undefined;
+      const table = node["Relation Name"] as string | undefined;
+      if (!table) {
+        if (schema && schema !== "pg_catalog" && !schemaAllowed(policy, schema)) {
+          throw new Error(
+            `function in schema "${schema}" is outside the allowlist of connection "${connection.name}"`,
+          );
+        }
+        continue;
+      }
+      if (!schemaAllowed(policy, schema)) {
+        throw new Error(
+          `"${schema}.${table}" is outside the schema allowlist of connection "${connection.name}"`,
+        );
+      }
+      if (policy.rules.length === 0) continue;
+      const hidden = (await relationColumns(client, schema!, table, columnCache)).filter((column) =>
+        columnHidden(policy, { schema, table, column }),
+      );
+      if (hidden.length === 0) continue;
+      // Columns this scan reads (Output, Filter, Index Cond…), qualified or not, plus whole-row refs.
+      const text = Object.entries(node)
+        .filter(([k]) => k !== "Plans")
+        .flatMap(([, v]) =>
+          typeof v === "string" ? [v] : Array.isArray(v) ? v.filter((x) => typeof x === "string") : [],
+        )
+        .join("\n")
+        // String constants ('api_token'::text) are not column references.
+        .replace(/'(?:[^']|'')*'/g, "''");
+      const alias = String(node.Alias ?? table);
+      const wholeRow = new RegExp(
+        `(?:^|[^A-Za-z0-9_$"])(?:"${escapeRe(alias.replace(/"/g, '""'))}"|${escapeRe(alias)})\\.\\*`,
+      );
+      const hit = wholeRow.test(text)
+        ? hidden[0]
+        : hidden.find((column) =>
+            new RegExp(
+              `(?:^|[^A-Za-z0-9_$])(?:"${escapeRe(column.replace(/"/g, '""'))}"|${escapeRe(column)})(?:$|[^A-Za-z0-9_$])`,
+            ).test(text),
+          );
+      if (hit) throw new Error(`column ${table}.${hit} is hidden on connection "${connection.name}"`);
+    }
+  }
+
+  async function relationColumns(
+    client: pg.ClientBase,
+    schema: string,
+    table: string,
+    cache = new Map<string, string[]>(),
+  ): Promise<string[]> {
+    const key = `${schema}.${table}`;
+    const hit = cache.get(key);
+    if (hit) return hit;
+    const res = await client.query<{ name: string }>(
+      "SELECT attname AS name FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+      [`${quoteIdent(schema)}.${quoteIdent(table)}`],
+    );
+    const names = res.rows.map((r) => r.name);
+    cache.set(key, names);
+    return names;
+  }
+
   async function readQuery(
     sql: string,
     values: unknown[],
@@ -189,6 +312,7 @@ export function createPostgresAdapter(
   ): Promise<QueryResult> {
     const started = Date.now();
     return inTransaction("read", timeoutMs, async (client) => {
+      await enforcePolicy(client, sql, values);
       const res = await readCursor(client, sql, values, maxRows + 1);
       const columns = await columnMeta(client, res.fields);
       return shape(res.rows, columns, maxRows, "read", {
@@ -343,8 +467,9 @@ export function createPostgresAdapter(
         );
         const referencedBy = await metaQuery(
           client,
-          `SELECT conrelid::regclass::text AS table, conname AS name, pg_get_constraintdef(oid, true) AS definition
-          FROM pg_constraint WHERE confrelid = $1 AND contype = 'f' ORDER BY 1, 2`,
+          `SELECT n.nspname || '.' || c.relname AS table, k.conname AS name, pg_get_constraintdef(k.oid, true) AS definition
+          FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE k.confrelid = $1 AND k.contype = 'f' ORDER BY 1, 2`,
           [rel.oid],
         );
         const view =
@@ -380,8 +505,26 @@ export function createPostgresAdapter(
     },
 
     async sampleTable(ref, limit, timeoutMs) {
-      const name = ref.schema ? `${quoteIdent(ref.schema)}.${quoteIdent(ref.table)}` : quoteIdent(ref.table);
-      return readQuery(`SELECT * FROM ${name} LIMIT ${Math.floor(limit)}`, [], limit, timeoutMs);
+      let name = ref.schema ? `${quoteIdent(ref.schema)}.${quoteIdent(ref.table)}` : quoteIdent(ref.table);
+      let select = "*";
+      if (policy) {
+        const rel = await inTransaction("read", META_TIMEOUT_MS, async (client) => {
+          const r = await resolveRelation(client, ref);
+          return { ...r, columns: await relationColumns(client, r.schema, r.name) };
+        });
+        if (!schemaAllowed(policy, rel.schema)) {
+          throw new Error(
+            `"${rel.schema}.${rel.name}" is outside the schema allowlist of connection "${connection.name}"`,
+          );
+        }
+        name = `${quoteIdent(rel.schema)}.${quoteIdent(rel.name)}`;
+        const visible = rel.columns.filter(
+          (column) => !columnHidden(policy, { schema: rel.schema, table: rel.name, column }),
+        );
+        if (visible.length === 0) throw new Error(`every column of ${rel.schema}.${rel.name} is hidden`);
+        select = visible.map(quoteIdent).join(", ");
+      }
+      return readQuery(`SELECT ${select} FROM ${name} LIMIT ${Math.floor(limit)}`, [], limit, timeoutMs);
     },
 
     async searchColumns({ pattern, schema, limit }) {
@@ -410,22 +553,71 @@ export function createPostgresAdapter(
         throw new Error(`statement needs ${input.classified} access`);
       }
       const started = Date.now();
+      // Sequences are not transactional: setval sticks, nextval (serial/identity defaults) is consumed.
+      let sequenceNote: Partial<QueryResult> = {};
+      if (input.dryRun) {
+        const stmts = classifySql(input.sql, "postgres");
+        const words = stmts.tokens.flat().flatMap((t) => (t.kind === "word" ? [t.value] : []));
+        // Session/cluster side effects (terminate backends, advisory locks, notify…) survive ROLLBACK.
+        const irreversible = stmts.tokens.map((t) => sideEffectCall(t, "postgres")).find(Boolean);
+        if (irreversible)
+          throw new Error(`dry_run cannot call ${irreversible}(): its effect is not rolled back`);
+        if (words.includes("SETVAL"))
+          throw new Error("dry_run cannot contain setval(): sequence changes are not rolled back");
+        if (
+          words.includes("NEXTVAL") ||
+          stmts.statements.some(
+            (st) =>
+              ["INSERT", "MERGE", "UPSERT"].includes(st.keyword) ||
+              st.reason?.includes("INSERT") ||
+              st.reason?.includes("MERGE"),
+          )
+        ) {
+          sequenceNote = {
+            note: "rolled back, except sequences: serial/identity defaults and nextval() values are consumed",
+          };
+        }
+      }
       if (input.classified !== "admin") {
-        // One statement (extended protocol), committed atomically, local timeout, bounded rows.
-        return inTransaction("write", input.timeoutMs, async (client) => {
-          const res = await readCursor(client, input.sql, values, input.maxRows + 1);
+        // One statement (extended protocol), committed atomically (or rolled back for dry runs).
+        return inTransaction(input.dryRun ? "dry_run" : "write", input.timeoutMs, async (client) => {
+          await enforcePolicy(client, input.sql, values);
+          // Writes drain the portal: the affected-row count only arrives once it completes.
+          const res = await readCursor(
+            client,
+            input.sql,
+            values,
+            input.maxRows + 1,
+            input.classified === "write",
+          );
           const columns = await columnMeta(client, res.fields);
           return shape(res.rows, columns, input.maxRows, input.classified, {
             command: res.command,
             affected_rows: res.rowCount,
+            ...(input.dryRun ? { rolled_back: true, ...sequenceNote } : {}),
             duration_ms: Date.now() - started,
           });
         });
       }
+      if (policy) throw new Error("admin statements are disabled on connections with a schema/column policy");
+      if (input.dryRun) {
+        const control = classifySql(input.sql, "postgres").statements.find((st) =>
+          TX_CONTROL.has(st.keyword),
+        );
+        if (control)
+          throw new Error(`dry_run cannot contain ${control.keyword}; it runs inside one transaction`);
+      }
       // admin DDL / scripts: autocommit (VACUUM, CREATE INDEX CONCURRENTLY…), simple protocol when no params.
+      // dry_run wraps the script in BEGIN … ROLLBACK (non-transactional commands then fail, as they should).
       return withClient(async (client) => {
-        const raw = (await client.query(input.sql, values.length ? values : undefined)) as
-          pg.QueryResult | pg.QueryResult[];
+        if (input.dryRun) await client.query("BEGIN");
+        let raw: pg.QueryResult | pg.QueryResult[];
+        try {
+          raw = (await client.query(input.sql, values.length ? values : undefined)) as
+            pg.QueryResult | pg.QueryResult[];
+        } finally {
+          if (input.dryRun) await client.query("ROLLBACK").catch(() => undefined);
+        }
         const results = Array.isArray(raw) ? raw : [raw];
         const last = results[results.length - 1]!;
         const columns = await columnMeta(client, last.fields ?? []);
@@ -433,6 +625,7 @@ export function createPostgresAdapter(
           command: last.command,
           affected_rows: last.rowCount,
           statements: results.length,
+          ...(input.dryRun ? { rolled_back: true, ...sequenceNote } : {}),
           duration_ms: Date.now() - started,
         });
       });
@@ -441,6 +634,7 @@ export function createPostgresAdapter(
     async explain({ sql, params, timeoutMs }) {
       const values = asArrayParams(params);
       return inTransaction("read", timeoutMs, async (client) => {
+        await enforcePolicy(client, sql, values);
         const res = await readCursor(client, `EXPLAIN (FORMAT JSON) ${sql}`, values, 10);
         const plan = res.rows[0]?.["QUERY PLAN"];
         return { plan: Array.isArray(plan) ? plan[0] : plan };

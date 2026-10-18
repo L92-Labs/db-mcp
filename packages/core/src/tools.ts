@@ -59,7 +59,18 @@ export const TOOL_SHAPES = {
   },
   sql_query: { connection, sql, params, max_rows: maxRows },
   sql_explain: { connection, sql, params },
-  sql_execute: { connection, sql, params, max_rows: maxRows },
+  sql_execute: {
+    connection,
+    sql,
+    params,
+    max_rows: maxRows,
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe(
+        "Run inside a transaction, report affected rows, then roll back (BigQuery: validate + estimate only)",
+      ),
+  },
 } as const;
 
 export type ToolName = keyof typeof TOOL_SHAPES;
@@ -86,7 +97,7 @@ export const TOOL_DESCRIPTIONS: Record<ToolName, string> = {
   sql_explain:
     "Show the query plan without executing (Postgres EXPLAIN FORMAT JSON) or dry-run cost (BigQuery bytes processed, statement type).",
   sql_execute:
-    "Run one SQL statement allowed by the connection access: read_write = SELECT + INSERT/UPDATE/DELETE/MERGE; admin = anything including DDL and multi-statement scripts.",
+    "Run one SQL statement allowed by the connection access: read_write = SELECT + INSERT/UPDATE/DELETE/MERGE; admin = anything including DDL (and multi-statement scripts on Postgres). Set dry_run to preview the effect and roll back.",
 };
 
 export const READ_ONLY_TOOLS = new Set<ToolName>(TOOL_NAMES.filter((t) => !WRITE_TOOLS.has(t)));

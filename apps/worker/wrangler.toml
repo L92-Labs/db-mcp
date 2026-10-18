@@ -1,7 +1,12 @@
 name = "db-mcp"
 main = "src/index.ts"
 compatibility_date = "2026-10-17"
-compatibility_flags = ["nodejs_compat"]
+# global_fetch_strictly_public: required for OAuth Client ID Metadata Documents (SSRF protection)
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+
+# Audit log lines (JSON, one per tool call) land in Workers Logs.
+[observability]
+enabled = true
 
 # Postgres via Hyperdrive. Create one per database:
 #   npx wrangler hyperdrive create db-mcp-main --connection-string="postgres://user:pass@host:5432/db"
@@ -12,13 +17,31 @@ binding = "HYPERDRIVE"
 id = "00000000000000000000000000000000"
 localConnectionString = "postgres://postgres:postgres@localhost:5432/postgres"
 
+# MySQL via Hyperdrive (optional): uncomment, then set MYSQL_HYPERDRIVE = "HYPERDRIVE_MYSQL"
+# or {"engine":"mysql","hyperdrive":"HYPERDRIVE_MYSQL"} in DB_CONNECTIONS_JSON.
+# [[hyperdrive]]
+# binding = "HYPERDRIVE_MYSQL"
+# id = "<id from: npx wrangler hyperdrive create db-mcp-mysql --connection-string=mysql://user:pass@host:3306/db>"
+# localConnectionString = "mysql://root:root@localhost:3306/app"
+
+# OAuth (AUTH_MODE = "oauth") stores clients, grants and tokens here (hashed / encrypted).
+#   npx wrangler kv namespace create OAUTH_KV
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
+
 [vars]
+AUTH_MODE = "bearer"            # bearer | oauth
 DB_ACCESS = "read_only"
 DB_MAX_ROWS = "200"
+DB_MAX_RESULT_BYTES = "100000"
 DB_STATEMENT_TIMEOUT_MS = "30000"
+DB_AUDIT_LOG = "meta"           # off | meta | sql
 
 # Secrets (wrangler secret put …):
-#   MCP_BEARER_TOKEN
-#   DB_CONNECTIONS_JSON           optional; postgres entries use "hyperdrive": "HYPERDRIVE"
+#   MCP_BEARER_TOKEN              static token (always accepted, also in oauth mode)
+#   DB_CONNECTIONS_JSON           optional; postgres/mysql entries use "hyperdrive": "<BINDING>"
 #   BIGQUERY_PROJECT_ID / BIGQUERY_CREDENTIALS_JSON / BIGQUERY_LOCATION   optional
+#   oauth + GitHub:   OAUTH_LOGIN=github, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OAUTH_ALLOWED_USERS
+#   oauth + password: OAUTH_LOGIN=password, OAUTH_PASSWORD (16+ chars)
 # With no DB_CONNECTIONS_JSON and no DATABASE_URL, the HYPERDRIVE binding becomes connection "postgres".

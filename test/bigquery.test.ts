@@ -3,6 +3,9 @@ import {
   bqRowsToObjects,
   clearTokenCache,
   createBigQueryAdapter,
+  createDispatchContext,
+  dispatchTool,
+  loadRuntimeConfig,
   serviceAccountTokenProvider,
   signServiceAccountJwt,
   toQueryParameters,
@@ -189,5 +192,224 @@ describe("service account auth", () => {
     expect(await p.getToken()).toBe("at");
     expect(await p.getToken()).toBe("at");
     expect(exchanges).toBe(1);
+  });
+});
+
+describe("BigQuery policy and dry run", () => {
+  const guarded: BigQueryConnection = {
+    ...conn,
+    access: "read_write",
+    schemas: ["analytics"],
+    hiddenColumns: ["email"],
+  };
+
+  function fetchWith(dry: Record<string, unknown>, calls: Call[]): typeof fetch {
+    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({
+        method: init?.method ?? "GET",
+        url,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      const ok = (v: unknown) => new Response(JSON.stringify(v), { status: 200 });
+      if (url.endsWith("/projects/proj/jobs")) return ok({ statistics: { query: dry } });
+      if (url.includes("/projects/proj/datasets?")) {
+        return ok({
+          datasets: [
+            { datasetReference: { projectId: "proj", datasetId: "analytics" } },
+            { datasetReference: { projectId: "proj", datasetId: "hr" } },
+          ],
+        });
+      }
+      if (url.endsWith("/tables/users")) {
+        return ok({
+          type: "TABLE",
+          schema: {
+            fields: [
+              { name: "id", type: "INT64" },
+              { name: "email", type: "STRING" },
+            ],
+          },
+        });
+      }
+      if (url.includes("/tables/users/data")) return ok({ rows: [{ f: [{ v: "1" }] }], totalRows: "1" });
+      if (url.endsWith("/projects/proj/queries"))
+        return ok({ jobComplete: true, schema: { fields: [] }, rows: [] });
+      return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+  }
+
+  const run = (a: ReturnType<typeof createBigQueryAdapter>, sql: string, dryRun = false) =>
+    a.run({ sql, maxRows: 10, timeoutMs: 1000, allow: "write", classified: "write", dryRun });
+
+  it("dry_run never executes and reports the estimate", async () => {
+    const calls: Call[] = [];
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith(
+        {
+          statementType: "DELETE",
+          totalBytesProcessed: "10",
+          referencedTables: [{ projectId: "proj", datasetId: "analytics", tableId: "t" }],
+        },
+        calls,
+      ),
+    });
+    const r = await run(a, "DELETE FROM analytics.t WHERE true", true);
+    expect(r).toMatchObject({ command: "DELETE", bytes_processed: 10, affected_rows: null, row_count: 0 });
+    expect(calls.some((c) => c.url.endsWith("/queries"))).toBe(false);
+  });
+
+  it("refuses referenced tables outside the dataset allowlist", async () => {
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith(
+        {
+          statementType: "SELECT",
+          referencedTables: [{ projectId: "proj", datasetId: "hr", tableId: "salaries" }],
+        },
+        [],
+      ),
+    });
+    await expect(run(a, "SELECT * FROM hr.salaries")).rejects.toThrow(/allowlist/);
+  });
+
+  it("refuses qualifiers naming a forbidden dataset (e.g. DML targets)", async () => {
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith({ statementType: "INSERT", referencedTables: [] }, []),
+    });
+    await expect(run(a, "INSERT INTO `proj.hr.salaries` (a) VALUES (1)")).rejects.toThrow(/dataset hr/);
+  });
+
+  it("refuses hidden columns in the output schema", async () => {
+    const a = createBigQueryAdapter(guarded, {
+      fetch: fetchWith(
+        {
+          statementType: "SELECT",
+          schema: {
+            fields: [
+              { name: "id", type: "INT64" },
+              { name: "EMAIL", type: "STRING" },
+            ],
+          },
+        },
+        [],
+      ),
+    });
+    await expect(run(a, "SELECT * FROM analytics.users")).rejects.toThrow(/hidden/);
+  });
+
+  it("table_sample selects only visible fields via tabledata.list", async () => {
+    const calls: Call[] = [];
+    const a = createBigQueryAdapter(guarded, { fetch: fetchWith({}, calls) });
+    const r = await a.sampleTable({ schema: "analytics", table: "users" }, 5, 1000);
+    expect(r.columns).toEqual([{ name: "id", type: "INT64" }]);
+    expect(calls.find((c) => c.url.includes("/users/data?"))!.url).toContain("selectedFields=id");
+    await expect(a.sampleTable({ schema: "hr", table: "users" }, 5, 1000)).rejects.toThrow(/allowlist/);
+  });
+});
+
+describe("BigQuery positional DML under hidden columns", () => {
+  it("refuses INSERT … VALUES and MERGE … INSERT ROW into a table with hidden columns", async () => {
+    const calls: Call[] = [];
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ method: init?.method ?? "GET", url });
+      if (url.endsWith("/tables/users")) {
+        return new Response(
+          JSON.stringify({
+            type: "TABLE",
+            schema: {
+              fields: [
+                { name: "id", type: "INT64" },
+                { name: "email", type: "STRING" },
+              ],
+            },
+          }),
+        );
+      }
+      return new Response(JSON.stringify({ statistics: { query: { statementType: "INSERT" } } }));
+    }) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "proj",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_ACCESS: "read_write",
+      BIGQUERY_HIDDEN_COLUMNS: "email",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    await expect(
+      dispatchTool("sql_execute", { sql: "INSERT INTO analytics.users VALUES (1, 'a@b.c')" }, ctx),
+    ).rejects.toThrow(/list the columns/);
+    await expect(
+      dispatchTool(
+        "sql_execute",
+        {
+          sql: "MERGE analytics.users t USING analytics.staging s ON t.id = s.id WHEN NOT MATCHED THEN INSERT ROW",
+        },
+        ctx,
+      ),
+    ).rejects.toThrow(/list the columns/);
+    expect(calls.some((c) => c.url.endsWith("/queries"))).toBe(false);
+  });
+});
+
+describe("BigQuery describe redaction", () => {
+  it("masks a STRUCT parent type that lists a hidden child", async () => {
+    const f = (async () =>
+      new Response(
+        JSON.stringify({
+          type: "TABLE",
+          schema: {
+            fields: [
+              { name: "id", type: "INT64" },
+              {
+                name: "address",
+                type: "RECORD",
+                fields: [
+                  { name: "secret", type: "STRING" },
+                  { name: "city", type: "STRING" },
+                ],
+              },
+            ],
+          },
+        }),
+      )) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "proj",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_HIDDEN_COLUMNS: "secret",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    const d = (await dispatchTool("table_describe", { table: "ds.users" }, ctx)) as any;
+    expect(d.columns.map((c: any) => c.name)).toEqual(["id", "address", "address.city"]);
+    expect(JSON.stringify(d.columns)).not.toContain("secret");
+  });
+});
+
+describe("BigQuery cross-project allowlist", () => {
+  it("describes an explicitly allowlisted dataset in another project", async () => {
+    const f = (async () =>
+      new Response(
+        JSON.stringify({ type: "TABLE", schema: { fields: [{ name: "id", type: "INT64" }] } }),
+      )) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "other-project",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_DATASETS: "allowed-project.analytics",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    const d = (await dispatchTool(
+      "table_describe",
+      { table: "allowed-project.analytics.users" },
+      ctx,
+    )) as any;
+    expect(d.project_id).toBe("allowed-project");
+    await expect(dispatchTool("table_describe", { table: "analytics.users" }, ctx)).rejects.toThrow(
+      /allowlist/,
+    );
   });
 });

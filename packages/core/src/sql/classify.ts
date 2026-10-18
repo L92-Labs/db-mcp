@@ -1,13 +1,17 @@
 import type { AccessLevel, Engine, StatementClass } from "../types.js";
 
 /**
- * Lightweight SQL lexer + classifier. Not a parser: it strips comments, strings and
- * quoted identifiers, splits on top-level `;`, and inspects keywords. It is the first
- * gate only — engines enforce access again (Postgres READ ONLY transactions,
+ * Lightweight SQL lexer + classifier. Not a parser: it strips comments and strings, keeps
+ * quoted identifiers as identifiers, splits on top-level `;`, and inspects keywords. It is
+ * the first gate only — engines enforce access again (Postgres/MySQL READ ONLY transactions,
  * BigQuery dry-run statementType).
  */
 
-type Token = { kind: "word"; value: string } | { kind: "punct"; value: string } | { kind: "literal" };
+export type Token =
+  | { kind: "word"; value: string; raw: string }
+  | { kind: "ident"; value: string }
+  | { kind: "punct"; value: string }
+  | { kind: "literal" };
 
 const CLASS_RANK: Record<StatementClass, number> = { read: 0, write: 1, admin: 2 };
 
@@ -39,7 +43,11 @@ export function splitStatements(sql: string, engine: Engine): Token[][] {
   let current: Token[] = [];
   let i = 0;
   const n = sql.length;
+  const pg = engine === "postgres";
   const bq = engine === "bigquery";
+  const my = engine === "mysql";
+  // MySQL executes the body of /*! … */ comments; we lex it as code and skip the closing */.
+  let execCommentDepth = 0;
 
   const pushLiteral = () => current.push({ kind: "literal" });
 
@@ -52,19 +60,32 @@ export function splitStatements(sql: string, engine: Engine): Token[][] {
       continue;
     }
 
-    // Line comments: -- (both), # (BigQuery)
-    if ((ch === "-" && next === "-") || (bq && ch === "#")) {
+    if (execCommentDepth > 0 && ch === "*" && next === "/") {
+      execCommentDepth--;
+      i += 2;
+      continue;
+    }
+
+    // Line comments: -- (MySQL needs whitespace after it), # (BigQuery, MySQL)
+    const dashComment = ch === "-" && next === "-" && (!my || i + 2 >= n || /\s/.test(sql[i + 2]!));
+    if (dashComment || ((bq || my) && ch === "#")) {
       const end = sql.indexOf("\n", i);
       i = end === -1 ? n : end + 1;
       continue;
     }
 
-    // Block comments (Postgres nests them)
     if (ch === "/" && next === "*") {
+      if (my && sql[i + 2] === "!") {
+        // /*!50001 SELECT … */ → lex the inside
+        i += 3;
+        while (i < n && /[0-9]/.test(sql[i]!)) i++;
+        execCommentDepth++;
+        continue;
+      }
       let depth = 1;
       i += 2;
       while (i < n && depth > 0) {
-        if (!bq && sql[i] === "/" && sql[i + 1] === "*") {
+        if (pg && sql[i] === "/" && sql[i + 1] === "*") {
           depth++;
           i += 2;
         } else if (sql[i] === "*" && sql[i + 1] === "/") {
@@ -86,7 +107,7 @@ export function splitStatements(sql: string, engine: Engine): Token[][] {
     }
 
     // Postgres dollar-quoted strings: $$…$$ or $tag$…$tag$ (not $1 params)
-    if (!bq && ch === "$") {
+    if (pg && ch === "$") {
       const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
       if (m) {
         const tag = m[0];
@@ -98,15 +119,15 @@ export function splitStatements(sql: string, engine: Engine): Token[][] {
       }
     }
 
-    // String / identifier prefixes: E'..' (pg), r'..' b'..' rb'..' (bq)
     if (isWordStart(ch)) {
       let j = i;
       while (j < n && isWordChar(sql[j]!)) j++;
       const word = sql.slice(i, j);
       const quote = sql[j];
       const lower = word.toLowerCase();
-      if (quote === "'" && !bq && (lower === "e" || lower === "b" || lower === "x" || lower === "n")) {
-        i = skipQuoted(sql, j, "'", lower === "e");
+      // String prefixes: E'..' B'..' X'..' N'..' (pg), r/b/rb (bq), _charset/N/X/B (mysql)
+      if (quote === "'" && pg && ["e", "b", "x", "n"].includes(lower)) {
+        i = skipQuoted(sql, j, "'", lower === "e").end;
         pushLiteral();
         continue;
       }
@@ -115,27 +136,39 @@ export function splitStatements(sql: string, engine: Engine): Token[][] {
         pushLiteral();
         continue;
       }
-      current.push({ kind: "word", value: word.toUpperCase() });
+      if ((quote === "'" || quote === '"') && my && (/^[nxb]$/.test(lower) || lower.startsWith("_"))) {
+        i = skipQuoted(sql, j, quote, true).end;
+        pushLiteral();
+        continue;
+      }
+      current.push({ kind: "word", value: word.toUpperCase(), raw: word });
       i = j;
       continue;
     }
 
     if (ch === "'") {
-      i = bq ? skipBigQueryString(sql, i) : skipQuoted(sql, i, "'", false);
+      i = bq ? skipBigQueryString(sql, i) : skipQuoted(sql, i, "'", my).end;
       pushLiteral();
       continue;
     }
 
     if (ch === '"') {
-      // Postgres: quoted identifier. BigQuery: string literal.
-      i = bq ? skipBigQueryString(sql, i) : skipQuoted(sql, i, '"', false);
-      pushLiteral();
+      if (pg) {
+        const { end, body } = skipQuoted(sql, i, '"', false);
+        current.push({ kind: "ident", value: body });
+        i = end;
+      } else {
+        // BigQuery and MySQL (default sql_mode): string literal
+        i = bq ? skipBigQueryString(sql, i) : skipQuoted(sql, i, '"', true).end;
+        pushLiteral();
+      }
       continue;
     }
 
-    if (bq && ch === "`") {
-      i = skipQuoted(sql, i, "`", true);
-      pushLiteral();
+    if ((bq || my) && ch === "`") {
+      const { end, body } = skipQuoted(sql, i, "`", bq);
+      current.push({ kind: "ident", value: body });
+      i = end;
       continue;
     }
 
@@ -148,21 +181,30 @@ export function splitStatements(sql: string, engine: Engine): Token[][] {
 }
 
 /** Skip a quoted run starting at `start` (the opening quote). Doubled quotes escape. */
-function skipQuoted(sql: string, start: number, quote: string, backslashEscapes: boolean): number {
+function skipQuoted(
+  sql: string,
+  start: number,
+  quote: string,
+  backslashEscapes: boolean,
+): { end: number; body: string } {
   let i = start + 1;
+  let body = "";
   while (i < sql.length) {
-    const ch = sql[i];
+    const ch = sql[i]!;
     if (backslashEscapes && ch === "\\") {
+      body += sql[i + 1] ?? "";
       i += 2;
       continue;
     }
     if (ch === quote) {
       if (sql[i + 1] === quote) {
+        body += quote;
         i += 2;
         continue;
       }
-      return i + 1;
+      return { end: i + 1, body };
     }
+    body += ch;
     i++;
   }
   throw new Error("unterminated quoted string or identifier");
@@ -191,36 +233,58 @@ const READ_STARTERS = new Set(["SELECT", "WITH", "VALUES", "TABLE", "SHOW", "FRO
 const WRITE_STARTERS = new Set(["INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE"]);
 const DML_WORDS = new Set(["INSERT", "UPDATE", "DELETE", "MERGE"]);
 
-/** Postgres functions with side effects that a READ ONLY transaction does not block. */
-const PG_SIDE_EFFECT_FUNCTIONS = new Set([
-  "PG_TERMINATE_BACKEND",
-  "PG_CANCEL_BACKEND",
-  "PG_RELOAD_CONF",
-  "PG_ROTATE_LOGFILE",
-  "PG_SWITCH_WAL",
-  "PG_CREATE_RESTORE_POINT",
-  "PG_PROMOTE",
-  "PG_LOG_BACKEND_MEMORY_CONTEXTS",
-  "PG_READ_FILE",
-  "PG_READ_BINARY_FILE",
-  "PG_LS_DIR",
-  "PG_STAT_FILE",
-  "LO_IMPORT",
-  "LO_EXPORT",
-  "DBLINK",
-  "DBLINK_EXEC",
-  "DBLINK_CONNECT",
-  "DBLINK_SEND_QUERY",
-  "PG_ADVISORY_LOCK",
-  "PG_ADVISORY_XACT_LOCK",
-  "PG_TRY_ADVISORY_LOCK",
-  "PG_ADVISORY_LOCK_SHARED",
-  "PG_NOTIFY",
-  "SET_CONFIG",
-  "PG_CREATE_LOGICAL_REPLICATION_SLOT",
-  "PG_CREATE_PHYSICAL_REPLICATION_SLOT",
-  "PG_DROP_REPLICATION_SLOT",
-]);
+/** Functions with side effects that a READ ONLY transaction does not block. */
+const SIDE_EFFECT_FUNCTIONS: Partial<Record<Engine, Set<string>>> = {
+  postgres: new Set([
+    "PG_TERMINATE_BACKEND",
+    "PG_CANCEL_BACKEND",
+    "PG_RELOAD_CONF",
+    "PG_ROTATE_LOGFILE",
+    "PG_SWITCH_WAL",
+    "PG_CREATE_RESTORE_POINT",
+    "PG_PROMOTE",
+    "PG_LOG_BACKEND_MEMORY_CONTEXTS",
+    "PG_READ_FILE",
+    "PG_READ_BINARY_FILE",
+    "PG_LS_DIR",
+    "PG_STAT_FILE",
+    "LO_IMPORT",
+    "LO_EXPORT",
+    "DBLINK",
+    "DBLINK_EXEC",
+    "DBLINK_CONNECT",
+    "DBLINK_SEND_QUERY",
+    "PG_ADVISORY_LOCK",
+    "PG_ADVISORY_XACT_LOCK",
+    "PG_TRY_ADVISORY_LOCK",
+    "PG_ADVISORY_LOCK_SHARED",
+    "PG_NOTIFY",
+    "SET_CONFIG",
+    "PG_CREATE_LOGICAL_REPLICATION_SLOT",
+    "PG_CREATE_PHYSICAL_REPLICATION_SLOT",
+    "PG_DROP_REPLICATION_SLOT",
+  ]),
+  mysql: new Set([
+    "LOAD_FILE",
+    "GET_LOCK",
+    "RELEASE_LOCK",
+    "RELEASE_ALL_LOCKS",
+    "MASTER_POS_WAIT",
+    "SOURCE_POS_WAIT",
+    "WAIT_FOR_EXECUTED_GTID_SET",
+  ]),
+};
+
+/** First side-effect function called anywhere in the tokens (`name(`), if any. */
+export function sideEffectCall(tokens: Token[], engine: Engine): string | null {
+  const fns = SIDE_EFFECT_FUNCTIONS[engine];
+  if (!fns) return null;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const t = tokens[i]!;
+    if (t.kind === "word" && fns.has(t.value) && isPunct(tokens[i + 1], "(")) return t.value.toLowerCase();
+  }
+  return null;
+}
 
 export type StatementInfo = {
   class: StatementClass;
@@ -245,8 +309,8 @@ function classifyTokens(tokens: Token[], engine: Engine): StatementInfo {
   }
   const keyword = first.value;
 
-  if (keyword === "EXPLAIN") {
-    return classifyExplain(tokens.slice(start + 1), engine);
+  if (keyword === "EXPLAIN" || (engine === "mysql" && (keyword === "DESCRIBE" || keyword === "DESC"))) {
+    return classifyExplain(tokens.slice(start + 1), engine, keyword);
   }
 
   if (READ_STARTERS.has(keyword)) {
@@ -255,19 +319,14 @@ function classifyTokens(tokens: Token[], engine: Engine): StatementInfo {
     if (dml) {
       return { class: "write", keyword, reason: `${keyword} contains ${dml}` };
     }
-    if (keyword === "SELECT" && ws.includes("INTO") && engine === "postgres") {
-      return { class: "admin", keyword, reason: "SELECT … INTO creates a table" };
+    if (keyword === "SELECT" && ws.includes("INTO") && engine !== "bigquery") {
+      return { class: "admin", keyword, reason: "SELECT … INTO writes a table, file or variable" };
     }
-    if (engine === "postgres") {
+    const fns = SIDE_EFFECT_FUNCTIONS[engine];
+    if (fns) {
       for (let i = 0; i < tokens.length - 1; i++) {
         const t = tokens[i]!;
-        const nxt = tokens[i + 1]!;
-        if (
-          t.kind === "word" &&
-          PG_SIDE_EFFECT_FUNCTIONS.has(t.value) &&
-          nxt.kind === "punct" &&
-          nxt.value === "("
-        ) {
+        if (t.kind === "word" && fns.has(t.value) && isPunct(tokens[i + 1], "(")) {
           return { class: "admin", keyword, reason: `calls side-effect function ${t.value.toLowerCase()}()` };
         }
       }
@@ -287,15 +346,15 @@ function classifyTokens(tokens: Token[], engine: Engine): StatementInfo {
   return { class: "admin", keyword };
 }
 
-function classifyExplain(rest: Token[], engine: Engine): StatementInfo {
+function classifyExplain(rest: Token[], engine: Engine, keyword: string): StatementInfo {
   let i = 0;
   let analyze = false;
-  if (rest[0]?.kind === "punct" && rest[0].value === "(") {
+  if (isPunct(rest[0], "(")) {
     let depth = 0;
     for (; i < rest.length; i++) {
       const t = rest[i]!;
-      if (t.kind === "punct" && t.value === "(") depth++;
-      else if (t.kind === "punct" && t.value === ")") {
+      if (isPunct(t, "(")) depth++;
+      else if (isPunct(t, ")")) {
         depth--;
         if (depth === 0) {
           i++;
@@ -304,24 +363,32 @@ function classifyExplain(rest: Token[], engine: Engine): StatementInfo {
       } else if (t.kind === "word" && (t.value === "ANALYZE" || t.value === "ANALYSE")) analyze = true;
     }
   } else {
-    const opts = new Set(["ANALYZE", "ANALYSE", "VERBOSE"]);
-    while (rest[i]?.kind === "word" && opts.has((rest[i] as { value: string }).value)) {
-      const w = (rest[i] as { value: string }).value;
-      if (w === "ANALYZE" || w === "ANALYSE") analyze = true;
-      i++;
+    const opts = new Set(["ANALYZE", "ANALYSE", "VERBOSE", "EXTENDED", "PARTITIONS"]);
+    for (;;) {
+      const t = rest[i];
+      if (t?.kind === "word" && opts.has(t.value)) {
+        if (t.value === "ANALYZE" || t.value === "ANALYSE") analyze = true;
+        i++;
+      } else if (t?.kind === "word" && t.value === "FORMAT" && isPunct(rest[i + 1], "=")) {
+        i += 3; // FORMAT = JSON (MySQL)
+      } else break;
     }
   }
   const inner = rest.slice(i);
-  if (inner.length === 0)
-    return { class: "admin", keyword: "EXPLAIN", reason: "EXPLAIN without a statement" };
+  if (inner.length === 0) {
+    // MySQL DESCRIBE t / EXPLAIN t: table metadata
+    return engine === "mysql"
+      ? { class: "read", keyword }
+      : { class: "admin", keyword, reason: "EXPLAIN without a statement" };
+  }
   const innerInfo = classifyTokens(inner, engine);
   if (!analyze) {
     // Plain EXPLAIN never executes the statement.
-    return { class: "read", keyword: "EXPLAIN" };
+    return { class: "read", keyword };
   }
   return {
     class: innerInfo.class,
-    keyword: "EXPLAIN",
+    keyword,
     reason: innerInfo.class === "read" ? undefined : `EXPLAIN ANALYZE executes ${innerInfo.keyword}`,
   };
 }
@@ -329,6 +396,7 @@ function classifyExplain(rest: Token[], engine: Engine): StatementInfo {
 export type SqlClassification = {
   class: StatementClass;
   statements: StatementInfo[];
+  tokens: Token[][];
 };
 
 export function classifySql(sql: string, engine: Engine): SqlClassification {
@@ -338,7 +406,7 @@ export function classifySql(sql: string, engine: Engine): SqlClassification {
   let cls: StatementClass = "read";
   for (const info of infos) cls = maxClass(cls, info.class);
   if (infos.length > 1) cls = maxClass(cls, "admin");
-  return { class: cls, statements: infos };
+  return { class: cls, statements: infos, tokens: stmts };
 }
 
 const CLASS_HINT: Record<StatementClass, string> = {
@@ -355,7 +423,12 @@ export function assertSqlAllowed(
   context: { connection: string; tool: string },
 ): SqlClassification {
   const result = classifySql(sql, engine);
-  if (classAllowed(result.class, allow)) return result;
+  if (classAllowed(result.class, allow)) {
+    if (engine === "mysql" && result.statements.length > 1) {
+      throw new Error("MySQL runs one statement per call; split the script into separate calls");
+    }
+    return result;
+  }
 
   if (result.statements.length > 1) {
     throw new Error(
@@ -372,4 +445,29 @@ export function assertSqlAllowed(
   throw new Error(
     `${info.keyword} statement${why} requires ${CLASS_HINT[result.class]} access; connection "${context.connection}" is ${CLASS_HINT[allow]}.`,
   );
+}
+
+/** Every identifier-like token (bare words + quoted identifiers, split on dots). */
+export function identifierTokens(tokens: Token[]): string[] {
+  const out: string[] = [];
+  for (const t of tokens) {
+    if (t.kind === "word") out.push(t.raw);
+    else if (t.kind === "ident") out.push(...t.value.split("."));
+  }
+  return out;
+}
+
+/** Names used as qualifiers: `x.` in `x.y` (and leading parts of `a.b.c` quoted identifiers). */
+export function qualifierTokens(tokens: Token[]): string[] {
+  const out: string[] = [];
+  tokens.forEach((t, i) => {
+    if (t.kind === "ident" && t.value.includes(".")) {
+      const parts = t.value.split(".");
+      out.push(...parts.slice(0, -1));
+    }
+    if ((t.kind === "word" || t.kind === "ident") && isPunct(tokens[i + 1], ".")) {
+      out.push(t.kind === "word" ? t.raw : t.value);
+    }
+  });
+  return out;
 }

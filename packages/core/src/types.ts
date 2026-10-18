@@ -1,4 +1,4 @@
-export type Engine = "postgres" | "bigquery";
+export type Engine = "postgres" | "bigquery" | "mysql";
 
 /** What a connection is allowed to run. Ordered: read_only < read_write < admin. */
 export type AccessLevel = "read_only" | "read_write" | "admin";
@@ -10,6 +10,10 @@ type BaseConnection = {
   name: string;
   access: AccessLevel;
   description?: string;
+  /** Allowlist of schemas (Postgres/MySQL) or datasets (BigQuery). Unset = all. */
+  schemas?: string[];
+  /** Column patterns hidden from agents: "password", "users.ssn", "public.users.*token*". */
+  hiddenColumns?: string[];
 };
 
 export type PostgresConnection = BaseConnection & {
@@ -36,13 +40,29 @@ export type BigQueryConnection = BaseConnection & {
   maxBytesBilled?: string;
 };
 
-export type ConnectionConfig = PostgresConnection | BigQueryConnection;
+export type MySqlConnection = BaseConnection & {
+  engine: "mysql";
+  /** mysql://… connection string (Node, or Workers without Hyperdrive). */
+  url?: string;
+  /** Workers only: name of the Hyperdrive binding. */
+  hyperdrive?: string;
+  ssl?: boolean | "require" | "no-verify";
+};
+
+export type ConnectionConfig = PostgresConnection | BigQueryConnection | MySqlConnection;
+
+export type AuditMode = "off" | "meta" | "sql";
 
 export type RuntimeConfig = {
   connections: Record<string, ConnectionConfig>;
   defaultConnection: string;
   maxRows: number;
   statementTimeoutMs: number;
+  /** Cap on the JSON size of returned rows (bytes). */
+  maxResultBytes: number;
+  /** Longer string cells are cut to this many characters. */
+  maxCellChars: number;
+  audit: AuditMode;
   mcpBearerToken?: string;
 };
 
@@ -72,6 +92,8 @@ export type RunInput = {
   allow: StatementClass;
   /** Class the local classifier computed (adapters may refine it, e.g. BigQuery dry run). */
   classified: StatementClass;
+  /** Run, report, then roll back (BigQuery: dry-run job only). */
+  dryRun?: boolean;
 };
 
 export type TableRef = { schema?: string; table: string };
@@ -96,6 +118,7 @@ export interface DbAdapter {
   listSchemas(input: { includeSystem: boolean }): Promise<Record<string, unknown>[]>;
   listTables(input: ListTablesInput): Promise<Record<string, unknown>[]>;
   describeTable(ref: TableRef): Promise<Record<string, unknown>>;
+  /** First rows; adapters select only columns the policy does not hide. */
   sampleTable(ref: TableRef, limit: number, timeoutMs: number): Promise<QueryResult>;
   searchColumns(input: SearchColumnsInput): Promise<Record<string, unknown>[]>;
   run(input: RunInput): Promise<QueryResult>;
