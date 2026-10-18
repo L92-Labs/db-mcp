@@ -275,6 +275,17 @@ const SIDE_EFFECT_FUNCTIONS: Partial<Record<Engine, Set<string>>> = {
   ]),
 };
 
+/** First side-effect function called anywhere in the tokens (`name(`), if any. */
+export function sideEffectCall(tokens: Token[], engine: Engine): string | null {
+  const fns = SIDE_EFFECT_FUNCTIONS[engine];
+  if (!fns) return null;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const t = tokens[i]!;
+    if (t.kind === "word" && fns.has(t.value) && isPunct(tokens[i + 1], "(")) return t.value.toLowerCase();
+  }
+  return null;
+}
+
 export type StatementInfo = {
   class: StatementClass;
   keyword: string;

@@ -424,3 +424,15 @@ describe.skipIf(!url)("postgres review fixes round 5 (live)", () => {
     ).rejects.toThrow(/setval/);
   });
 });
+
+describe.skipIf(!url)("postgres review fixes round 7 (live)", () => {
+  it("admin dry_run refuses irreversible side-effect functions", async () => {
+    const admin = ctxFor("admin");
+    await expect(
+      dispatchTool("sql_execute", { sql: "SELECT pg_advisory_lock(42)", dry_run: true }, admin),
+    ).rejects.toThrow(/pg_advisory_lock\(\): its effect is not rolled back/);
+    await expect(
+      dispatchTool("sql_execute", { sql: "SELECT pg_terminate_backend(0)", dry_run: true }, admin),
+    ).rejects.toThrow(/pg_terminate_backend/);
+  });
+});

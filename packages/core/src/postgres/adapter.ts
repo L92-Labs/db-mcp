@@ -2,7 +2,7 @@ import pg from "pg";
 import Cursor from "pg-cursor";
 import { likePattern, toJsonValue } from "../format.js";
 import { columnHidden, policyFor, schemaAllowed } from "../policy.js";
-import { classAllowed, classifySql } from "../sql/classify.js";
+import { classAllowed, classifySql, sideEffectCall } from "../sql/classify.js";
 import type {
   ColumnMeta,
   DbAdapter,
@@ -558,6 +558,10 @@ export function createPostgresAdapter(
       if (input.dryRun) {
         const stmts = classifySql(input.sql, "postgres");
         const words = stmts.tokens.flat().flatMap((t) => (t.kind === "word" ? [t.value] : []));
+        // Session/cluster side effects (terminate backends, advisory locks, notify…) survive ROLLBACK.
+        const irreversible = stmts.tokens.map((t) => sideEffectCall(t, "postgres")).find(Boolean);
+        if (irreversible)
+          throw new Error(`dry_run cannot call ${irreversible}(): its effect is not rolled back`);
         if (words.includes("SETVAL"))
           throw new Error("dry_run cannot contain setval(): sequence changes are not rolled back");
         if (
