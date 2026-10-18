@@ -409,3 +409,18 @@ describe.skipIf(!url)("postgres review fixes round 4 (live)", () => {
     ).rejects.toThrow(/list the columns/);
   });
 });
+
+describe.skipIf(!url)("postgres review fixes round 5 (live)", () => {
+  it("dry-run INSERT flags sequences; setval is refused", async () => {
+    const rw = ctxFor("read_write");
+    const r = (await dispatchTool(
+      "sql_execute",
+      { sql: "INSERT INTO shop.customers (email) VALUES ('seq@y.z')", dry_run: true },
+      rw,
+    )) as any;
+    expect(r.note).toMatch(/sequences/);
+    await expect(
+      dispatchTool("sql_execute", { sql: "SELECT setval('shop.orders_id_seq', 1000)", dry_run: true }, rw),
+    ).rejects.toThrow(/setval/);
+  });
+});

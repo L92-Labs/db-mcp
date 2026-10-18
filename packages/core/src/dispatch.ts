@@ -254,7 +254,8 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
       assertSchema(policy, ref.schema, connection.name);
       const d = await ctx.adapterFor(connection).describeTable(ref);
       const schema = d.schema as string | undefined;
-      assertSchema(policy, schema, connection.name);
+      // BigQuery reports the dataset and its project separately; check them together.
+      assertSchema(policy, d.project_id ? `${d.project_id}.${schema}` : schema, connection.name);
       if (policy && Array.isArray(d.columns)) {
         const table = String(d.name ?? ref.table);
         const visible = (d.columns as Array<{ name: string }>).filter(

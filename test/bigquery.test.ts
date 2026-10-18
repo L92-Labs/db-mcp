@@ -387,3 +387,29 @@ describe("BigQuery describe redaction", () => {
     expect(JSON.stringify(d.columns)).not.toContain("secret");
   });
 });
+
+describe("BigQuery cross-project allowlist", () => {
+  it("describes an explicitly allowlisted dataset in another project", async () => {
+    const f = (async () =>
+      new Response(
+        JSON.stringify({ type: "TABLE", schema: { fields: [{ name: "id", type: "INT64" }] } }),
+      )) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "other-project",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_DATASETS: "allowed-project.analytics",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    const d = (await dispatchTool(
+      "table_describe",
+      { table: "allowed-project.analytics.users" },
+      ctx,
+    )) as any;
+    expect(d.project_id).toBe("allowed-project");
+    await expect(dispatchTool("table_describe", { table: "analytics.users" }, ctx)).rejects.toThrow(
+      /allowlist/,
+    );
+  });
+});

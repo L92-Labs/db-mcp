@@ -553,6 +553,27 @@ export function createPostgresAdapter(
         throw new Error(`statement needs ${input.classified} access`);
       }
       const started = Date.now();
+      // Sequences are not transactional: setval sticks, nextval (serial/identity defaults) is consumed.
+      let sequenceNote: Partial<QueryResult> = {};
+      if (input.dryRun) {
+        const stmts = classifySql(input.sql, "postgres");
+        const words = stmts.tokens.flat().flatMap((t) => (t.kind === "word" ? [t.value] : []));
+        if (words.includes("SETVAL"))
+          throw new Error("dry_run cannot contain setval(): sequence changes are not rolled back");
+        if (
+          words.includes("NEXTVAL") ||
+          stmts.statements.some(
+            (st) =>
+              ["INSERT", "MERGE", "UPSERT"].includes(st.keyword) ||
+              st.reason?.includes("INSERT") ||
+              st.reason?.includes("MERGE"),
+          )
+        ) {
+          sequenceNote = {
+            note: "rolled back, except sequences: serial/identity defaults and nextval() values are consumed",
+          };
+        }
+      }
       if (input.classified !== "admin") {
         // One statement (extended protocol), committed atomically (or rolled back for dry runs).
         return inTransaction(input.dryRun ? "dry_run" : "write", input.timeoutMs, async (client) => {
@@ -569,7 +590,7 @@ export function createPostgresAdapter(
           return shape(res.rows, columns, input.maxRows, input.classified, {
             command: res.command,
             affected_rows: res.rowCount,
-            ...(input.dryRun ? { rolled_back: true } : {}),
+            ...(input.dryRun ? { rolled_back: true, ...sequenceNote } : {}),
             duration_ms: Date.now() - started,
           });
         });
@@ -600,7 +621,7 @@ export function createPostgresAdapter(
           command: last.command,
           affected_rows: last.rowCount,
           statements: results.length,
-          ...(input.dryRun ? { rolled_back: true } : {}),
+          ...(input.dryRun ? { rolled_back: true, ...sequenceNote } : {}),
           duration_ms: Date.now() - started,
         });
       });

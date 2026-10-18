@@ -316,3 +316,14 @@ describe("policy (review round 4)", () => {
     expect(e.connection).toBe("main");
   });
 });
+
+describe("policy (review round 5)", () => {
+  it("Postgres refuses qualified functions outside the allowlist", () => {
+    const p = policyFor(conn({ schemas: ["shop"] }))!;
+    const check = (sql: string) =>
+      assertSqlPolicy(sql, "postgres", p, classifySql(sql, "postgres").statements, "c");
+    expect(() => check("SELECT secret.read_vault()")).toThrow(/function in schema "secret"/);
+    expect(() => check("SELECT pg_catalog.now(), shop.f(1)")).not.toThrow();
+    expect(() => check("SELECT o.id FROM shop.orders o")).not.toThrow();
+  });
+});

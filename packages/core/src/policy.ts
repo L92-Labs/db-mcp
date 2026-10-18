@@ -288,6 +288,25 @@ export function assertSqlPolicy(
           `"${id}" matches hidden column pattern "${rule.source}" on connection "${connection}"`,
         );
     }
+    if (policy.schemas && engine === "postgres") {
+      // Qualified function calls (`secret.read_vault()`) are invisible to the plan's relation check.
+      stmt.forEach((t, i) => {
+        const fn = stmt[i + 2];
+        if (
+          (t.kind === "word" || t.kind === "ident") &&
+          isPunct(stmt[i + 1], ".") &&
+          (fn?.kind === "word" || fn?.kind === "ident") &&
+          isPunct(stmt[i + 3], "(")
+        ) {
+          const schema = t.kind === "word" ? t.raw.toLowerCase() : t.value;
+          if (schema !== "pg_catalog" && !schemaAllowed(policy, schema)) {
+            throw new Error(
+              `function in schema "${schema}" is outside the allowlist of connection "${connection}"`,
+            );
+          }
+        }
+      });
+    }
     if (policy.schemas && engine !== "postgres") {
       // Catalog schemas only matter as qualifiers (`information_schema.tables`), not as column names.
       const system = qualifierTokens(stmt).find((q) => SYSTEM_SCHEMAS.has(q.toUpperCase()));
