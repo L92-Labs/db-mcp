@@ -327,3 +327,21 @@ describe("policy (review round 5)", () => {
     expect(() => check("SELECT o.id FROM shop.orders o")).not.toThrow();
   });
 });
+
+describe("policy (review round 6)", () => {
+  it("star projections after MySQL SELECT modifiers are detected", () => {
+    const t = (sql: string) => splitStatements(sql, "mysql")[0]!;
+    expect(hasStarProjection(t("INSERT INTO a SELECT SQL_NO_CACHE * FROM customers"))).toBe(true);
+    expect(hasStarProjection(t("INSERT INTO a SELECT HIGH_PRIORITY STRAIGHT_JOIN * FROM customers"))).toBe(
+      true,
+    );
+  });
+  it("Postgres name-lookup functions are refused under an allowlist", () => {
+    const p = policyFor(conn({ schemas: ["shop"] }))!;
+    const check = (sql: string) =>
+      assertSqlPolicy(sql, "postgres", p, classifySql(sql, "postgres").statements, "c");
+    expect(() => check("SELECT 'secret.vault'::regclass")).toThrow(/regclass/);
+    expect(() => check("SELECT pg_relation_size('secret.vault')")).toThrow(/pg_relation_size/);
+    expect(() => check("SELECT pg_get_viewdef('secret.v')")).toThrow(/pg_get_viewdef/);
+  });
+});

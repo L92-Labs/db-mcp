@@ -3,7 +3,9 @@ import {
   CimdFetchError,
   OAuthProvider,
   authorizationErrorRedirect,
+  insufficientScope,
   type ConsentDescription,
+  type OAuthResourceAuth,
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
 import type { AccessLevel } from "@db-mcp/core";
@@ -33,7 +35,9 @@ export function oauthProvider(origin: string, handleMcp: McpHandler): OAuthProvi
     apiRoute: "/mcp",
     apiHandler: {
       async fetch(request, env, ctx) {
-        const { props, auth } = ctx as unknown as { props: AuthProps; auth: { scope: string[] } };
+        const { props, auth } = ctx as unknown as { props: AuthProps; auth: OAuthResourceAuth };
+        // requiredScopes is only advertised by the library: enforce it here.
+        if (!auth?.scope?.includes("db:read")) return insufficientScope(auth, ["db:read"]);
         return handleMcp(request, env as WorkerEnv, {
           principal: props?.principal ?? "oauth",
           maxAccess: auth?.scope?.includes("db:write") ? "admin" : "read_only",

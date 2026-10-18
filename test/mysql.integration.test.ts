@@ -357,3 +357,23 @@ describe.skipIf(!url)("mysql review fixes round 4 (live)", () => {
     }
   });
 });
+
+describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {
+  it("table lookups follow the server's case sensitivity", async () => {
+    const guarded = ctxFor("read_write", { MYSQL_HIDDEN_COLUMNS: "Customers.secret_col" });
+    const root = await mysql.createConnection(url!);
+    const [[{ lctn }]] = (await root.query("SELECT @@lower_case_table_names AS lctn")) as any;
+    if (Number(lctn) !== 0) return void (await root.end());
+    await root.query("CREATE TABLE IF NOT EXISTS shop.Customers (id INT, secret_col VARCHAR(10))");
+    try {
+      await expect(
+        dispatchTool("sql_execute", { sql: "INSERT INTO Customers VALUES (1, 'x')", dry_run: true }, guarded),
+      ).rejects.toThrow(/list the columns/);
+      const d = (await dispatchTool("table_describe", { table: "customers" }, guarded)) as any;
+      expect(d.name).toBe("customers");
+    } finally {
+      await root.query("DROP TABLE shop.Customers");
+      await root.end();
+    }
+  });
+});

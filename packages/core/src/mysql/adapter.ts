@@ -94,6 +94,7 @@ export function createMySqlAdapter(
 ): DbAdapter {
   const policy = policyFor(connection);
   let caseChecked = false;
+  let serverFoldsCase = false;
   let timeoutVar: "max_execution_time" | "max_statement_time" | null | undefined;
 
   async function withClient<T>(fn: (client: MySqlClient, discard: () => void) => Promise<T>): Promise<T> {
@@ -266,11 +267,14 @@ export function createMySqlAdapter(
 
   /** Before running: default database and every schema-qualified name must be allowed. */
   /** lower_case_table_names = 0 → database names are case-sensitive (shop ≠ SHOP). */
-  async function detectCaseFolding(client: MySqlClient): Promise<void> {
-    if (!policy || caseChecked) return;
-    const [[row]] = await q<RowDataPacket[]>(client, "SELECT @@lower_case_table_names AS lctn");
-    policy.foldCase = Number(row?.lctn ?? 0) !== 0;
-    caseChecked = true;
+  async function detectCaseFolding(client: MySqlClient): Promise<boolean> {
+    if (!caseChecked) {
+      const [[row]] = await q<RowDataPacket[]>(client, "SELECT @@lower_case_table_names AS lctn");
+      serverFoldsCase = Number(row?.lctn ?? 0) !== 0;
+      caseChecked = true;
+    }
+    if (policy) policy.foldCase = serverFoldsCase;
+    return serverFoldsCase;
   }
 
   async function enforceSql(client: MySqlClient, sql: string): Promise<void> {
@@ -528,7 +532,12 @@ export function createMySqlAdapter(
       `SELECT t.TABLE_SCHEMA AS \`schema\`, t.TABLE_NAME AS name, t.TABLE_TYPE AS type, t.TABLE_ROWS AS \`rows\`,
          t.TABLE_COMMENT AS comment, t.TABLE_SCHEMA = DATABASE() AS current_db, t.TABLE_NAME = ? AS exact
        FROM information_schema.TABLES t
-       WHERE LOWER(t.TABLE_NAME) = LOWER(?) AND (? IS NULL OR LOWER(t.TABLE_SCHEMA) = LOWER(?))
+       WHERE ${
+         (await detectCaseFolding(client))
+           ? "LOWER(t.TABLE_NAME) = LOWER(?) AND (? IS NULL OR LOWER(t.TABLE_SCHEMA) = LOWER(?))"
+           : // lower_case_table_names = 0: Customers and customers are different tables
+             "BINARY t.TABLE_NAME = ? AND (? IS NULL OR BINARY t.TABLE_SCHEMA = ?)"
+       }
        ORDER BY exact DESC, current_db DESC, t.TABLE_SCHEMA`,
       [ref.table, ref.table, ref.schema ?? null, ref.schema ?? null],
     );

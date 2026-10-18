@@ -119,13 +119,29 @@ function isWord(t: Token | undefined, value?: string): boolean {
   return t?.kind === "word" && (value === undefined || t.value === value);
 }
 
+const SELECT_PREFIX = new Set([
+  "SELECT",
+  "DISTINCT",
+  "DISTINCTROW",
+  "ALL",
+  "HIGH_PRIORITY",
+  "STRAIGHT_JOIN",
+  "SQL_SMALL_RESULT",
+  "SQL_BIG_RESULT",
+  "SQL_BUFFER_RESULT",
+  "SQL_NO_CACHE",
+  "SQL_CACHE",
+  "SQL_CALC_FOUND_ROWS",
+]);
+
 /** `*` used as a select-list projection (`SELECT *`, `t.*`, `, *`) rather than multiplication or COUNT(*). */
 export function hasStarProjection(tokens: Token[]): boolean {
   return tokens.some((t, i) => {
     if (!isPunct(t, "*")) return false;
     const prev = tokens[i - 1];
     const next = tokens[i + 1];
-    const afterSelect = isWord(prev, "SELECT") || isWord(prev, "DISTINCT") || isWord(prev, "ALL");
+    // SELECT [DISTINCT | ALL | MySQL modifiers…] *
+    const afterSelect = prev?.kind === "word" && SELECT_PREFIX.has(prev.value);
     const qualified = isPunct(prev, ".");
     const listed = isPunct(prev, ",") && (isWord(next, "FROM") || isPunct(next, ","));
     return afterSelect || qualified || listed;
@@ -252,6 +268,31 @@ function ruleApplies(rule: Rule, tokens: Token[], idents: string[]): string | nu
   return hit ? column : null;
 }
 
+const PG_NAME_LOOKUPS = new Set([
+  "REGCLASS",
+  "REGPROC",
+  "REGPROCEDURE",
+  "REGNAMESPACE",
+  "TO_REGCLASS",
+  "TO_REGPROC",
+  "TO_REGNAMESPACE",
+  "PG_RELATION_SIZE",
+  "PG_TOTAL_RELATION_SIZE",
+  "PG_TABLE_SIZE",
+  "PG_INDEXES_SIZE",
+  "PG_GET_VIEWDEF",
+  "PG_GET_INDEXDEF",
+  "PG_GET_CONSTRAINTDEF",
+  "PG_GET_FUNCTIONDEF",
+  "PG_GET_TRIGGERDEF",
+  "HAS_TABLE_PRIVILEGE",
+  "HAS_COLUMN_PRIVILEGE",
+  "HAS_SCHEMA_PRIVILEGE",
+  "OBJ_DESCRIPTION",
+  "COL_DESCRIPTION",
+  "PG_GET_SERIAL_SEQUENCE",
+]);
+
 const SYSTEM_SCHEMAS = new Set(["INFORMATION_SCHEMA", "PERFORMANCE_SCHEMA", "MYSQL", "SYS"]);
 
 const MYSQL_METADATA_KEYWORDS = new Set(["SHOW", "DESCRIBE", "DESC", "EXPLAIN"]);
@@ -289,6 +330,13 @@ export function assertSqlPolicy(
         );
     }
     if (policy.schemas && engine === "postgres") {
+      // Functions and casts that look objects up by name bypass the plan's relation check.
+      const byName = stmt.find((t) => t.kind === "word" && PG_NAME_LOOKUPS.has(t.value));
+      if (byName && byName.kind === "word") {
+        throw new Error(
+          `${byName.raw} is disabled on connection "${connection}" (schema allowlist); use table_describe / tables_list`,
+        );
+      }
       // Qualified function calls (`secret.read_vault()`) are invisible to the plan's relation check.
       stmt.forEach((t, i) => {
         const fn = stmt[i + 2];
