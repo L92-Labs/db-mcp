@@ -1,0 +1,23 @@
+services:
+  db-mcp:
+    build: .
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+      PORT: "8787"
+    restart: unless-stopped
+
+  # Optional demo database: `docker compose --profile demo up --build`
+  # then DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres in .env
+  postgres:
+    profiles: ["demo"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./examples/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    ports:
+      - "5432:5432"

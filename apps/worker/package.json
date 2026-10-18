@@ -1,0 +1,24 @@
+{
+  "name": "@db-mcp/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @db-mcp/core build && wrangler dev",
+    "deploy": "pnpm --filter @db-mcp/core build && wrangler deploy",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
+    "@db-mcp/core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "@types/pg": "^8.15.0",
+    "typescript": "^5.8.0",
+    "wrangler": "^4.42.0"
+  }
+}

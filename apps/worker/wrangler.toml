@@ -1,0 +1,24 @@
+name = "db-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-10-17"
+compatibility_flags = ["nodejs_compat"]
+
+# Postgres via Hyperdrive. Create one per database:
+#   npx wrangler hyperdrive create db-mcp-main --connection-string="postgres://user:pass@host:5432/db"
+# then paste the id below. For `wrangler dev`, localConnectionString points at a local/dev database
+# (or set CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE).
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "00000000000000000000000000000000"
+localConnectionString = "postgres://postgres:postgres@localhost:5432/postgres"
+
+[vars]
+DB_ACCESS = "read_only"
+DB_MAX_ROWS = "200"
+DB_STATEMENT_TIMEOUT_MS = "30000"
+
+# Secrets (wrangler secret put …):
+#   MCP_BEARER_TOKEN
+#   DB_CONNECTIONS_JSON           optional; postgres entries use "hyperdrive": "HYPERDRIVE"
+#   BIGQUERY_PROJECT_ID / BIGQUERY_CREDENTIALS_JSON / BIGQUERY_LOCATION   optional
+# With no DB_CONNECTIONS_JSON and no DATABASE_URL, the HYPERDRIVE binding becomes connection "postgres".

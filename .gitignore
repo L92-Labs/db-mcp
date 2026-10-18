@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+!.dev.vars.example
+*.log
+.DS_Store
+coverage/
+.turbo/
+.cf-bootstrap.json
+.env.infra

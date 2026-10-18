@@ -1,0 +1,27 @@
+{
+  "name": "@db-mcp/node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "db-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@db-mcp/core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "dotenv": "^16.5.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}

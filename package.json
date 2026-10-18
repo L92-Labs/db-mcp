@@ -1,0 +1,29 @@
+{
+  "name": "db-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Database MCP (Postgres + BigQuery) — Docker or Cloudflare Workers + Hyperdrive, read-only or read/write",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.18.0",
+  "scripts": {
+    "build": "pnpm --filter @db-mcp/core build && pnpm --filter @db-mcp/node build",
+    "typecheck": "pnpm --filter @db-mcp/core build && pnpm -r typecheck",
+    "test": "vitest run",
+    "dev:node": "pnpm --filter @db-mcp/node dev",
+    "start:node": "pnpm --filter @db-mcp/node start",
+    "dev:worker": "pnpm --filter @db-mcp/worker dev",
+    "deploy:worker": "pnpm --filter @db-mcp/worker deploy"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.1",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
