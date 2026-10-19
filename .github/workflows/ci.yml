@@ -1,0 +1,124 @@
+name: CI and containers
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-mcp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: shop
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm typecheck
+      - name: Seed isolated test databases
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+        run: |
+          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 < examples/seed.sql
+          docker exec -i "$MYSQL_CONTAINER" mysql -uroot -proot < examples/seed.mysql.sql
+      - name: Unit and real database integration tests
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+          TEST_MYSQL_URL: mysql://root:root@127.0.0.1:3306/shop
+        run: pnpm test
+      - name: Build Docker image (no publishing on PRs)
+        run: docker build --tag db-mcp:ci .
+      - name: Read-only container MCP smoke test
+        run: |
+          docker run -d --name db-mcp-smoke --read-only --network host \
+            -e DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+            -e MYSQL_URL=mysql://root:root@127.0.0.1:3306/shop \
+            -e DB_ACCESS=read_only -e MCP_BEARER_TOKEN=ci-token db-mcp:ci
+          trap 'docker logs db-mcp-smoke; docker rm -f db-mcp-smoke' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8787/health; then
+              MCP_BEARER_TOKEN=ci-token node scripts/check-http.mjs http://127.0.0.1:8787
+              exit $?
+            fi
+            sleep 1
+          done
+          exit 1
+
+  publish:
+    needs: checks
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    # Lock before checkout/tag fetch; keep older queued releases from being dropped.
+    concurrency:
+      group: db-mcp-ghcr-publish
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Validate release metadata before registry login
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=''
+          if [ "$REF_TYPE" = tag ]; then version="${REF_NAME#v}"; fi
+          node scripts/image-tags.mjs "$version"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish amd64 and arm64 manifest
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=''
+          if [ "$REF_TYPE" = tag ]; then version="${REF_NAME#v}"; fi
+          node scripts/publish-image.mjs --version "$version" --push

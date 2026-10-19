@@ -5,3 +5,9 @@
 .env
 .env.*
 **/.dev.vars
+**/.dev.vars.*
+**/.env
+**/.env.*
+.github
+*.log
+coverage
