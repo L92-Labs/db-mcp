@@ -1,0 +1,22 @@
+# Published-image alternative to docker-compose.yml. No source build required.
+services:
+  db-mcp:
+    image: ${DB_MCP_IMAGE:-ghcr.io/l92-labs/db-mcp:latest}
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: http
+      PORT: "8787"
+    ports:
+      - "127.0.0.1:8787:8787"
+    read_only: true
+    restart: unless-stopped
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [tunnel]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      db-mcp:
+        condition: service_healthy
+    restart: unless-stopped

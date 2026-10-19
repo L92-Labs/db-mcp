@@ -2,6 +2,52 @@
 
 Database **MCP** server for L92 Labs: **Postgres**, **MySQL** and **BigQuery**. One tool surface, two runtimes:
 
+Start here: [published Docker image](#quick-start-published-image),
+[releases and manual publishing](docs/releases.md),
+[contributing](CONTRIBUTING.md), [security](SECURITY.md), [changelog](CHANGELOG.md).
+
+## Quick start: published image
+
+Requires Docker Compose v2. Images become available after the first successful
+publish; anonymous pulls require the GHCR package to be public.
+
+```bash
+cp .env.example .env
+# Edit .env: real DB connection + strong MCP_BEARER_TOKEN; keep DB_ACCESS=read_only.
+# Generate a bearer token: openssl rand -hex 32
+docker compose -f docker-compose.image.yml pull
+docker compose -f docker-compose.image.yml up -d
+curl --fail http://127.0.0.1:8787/health
+```
+
+Connect a Streamable HTTP MCP client to `http://127.0.0.1:8787/mcp` with
+`Authorization: Bearer <your-token>`. The database host must be reachable from
+inside the container; `localhost` in a DB URL refers to the container itself.
+`/health` checks server/config availability, not database access; call
+`connection_info` to verify the connection.
+
+Set `DB_MCP_IMAGE=ghcr.io/l92-labs/db-mcp:0.1.0` in `.env` to select a release,
+or use `ghcr.io/l92-labs/db-mcp@sha256:<digest>` for a pinned image. Available
+tags: stable `latest`, exact SemVer, and `sha-<full-commit>`. Main commits and
+prereleases never advance `latest`.
+
+For a Cloudflare Tunnel, set `TUNNEL_TOKEN`, configure the tunnel's public HTTPS
+hostname to service `http://db-mcp:8787`, then run:
+
+```bash
+docker compose -f docker-compose.image.yml --profile tunnel up -d
+```
+
+Remote clients use `https://<your-hostname>/mcp` with the same bearer header.
+Node/Docker uses bearer authentication; OAuth is implemented by the Worker.
+Both Compose configurations bind the app to loopback and run it read-only as a
+non-root user. The source Compose file also contains optional demo databases.
+
+To update, change `DB_MCP_IMAGE` if pinned, then repeat `pull` and `up -d`.
+To roll back, set the previous version/digest and repeat those commands.
+Inspect status/logs with `docker compose -f docker-compose.image.yml ps` and
+`docker compose -f docker-compose.image.yml logs --tail=100 db-mcp`.
+
 | Runtime | Entry | Auth | Good for |
 |---------|-------|------|----------|
 | **Node** | stdio or Streamable HTTP | bearer token | Local MCP clients, Docker on any host |
@@ -137,7 +183,9 @@ node scripts/smoke.mjs http://localhost:8787/mcp "$MCP_BEARER_TOKEN"
 
 Demo databases with a seeded `shop` schema: `docker compose --profile demo up --build`. Then set `DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres` and `MYSQL_URL=mysql://root:root@mysql:3306/shop`.
 
-Remote MCP clients connect to `http://HOST:8787/mcp` with the header `Authorization: Bearer <MCP_BEARER_TOKEN>`. Put Docker behind TLS (Caddy, Cloudflare Tunnel) when exposed.
+Local MCP clients connect to `http://127.0.0.1:8787/mcp` with the header
+`Authorization: Bearer <MCP_BEARER_TOKEN>`. Remote access requires an HTTPS reverse
+proxy (Caddy, Cloudflare Tunnel). Demo database ports also bind only to loopback.
 
 ## Cloudflare Workers + Hyperdrive
 
