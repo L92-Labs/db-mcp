@@ -470,23 +470,34 @@ describe.skipIf(!url)("mysql review fixes round 7 (live)", () => {
     const rw = ctxFor("read_write");
     const root = await mysql.createConnection(url!);
     await root.query("CREATE DATABASE IF NOT EXISTS r7probe");
-    await root.query("CREATE TABLE r7probe.t1 (id INT, x INT) ENGINE=InnoDB");
+    // k0…k15 indexes so USE INDEX shapes are valid SQL.
+    const indexes = Array.from({ length: 16 }, (_, i) => `INDEX k${i} (id)`).join(", ");
+    await root.query(`CREATE TABLE r7probe.t1 (id INT, x INT, ${indexes}) ENGINE=InnoDB`);
     await root.query("CREATE TABLE r7probe.t2 (id INT, y INT) ENGINE=MyISAM");
     await root.query("CREATE TRIGGER r7probe.t2_bi BEFORE UPDATE ON r7probe.t2 FOR EACH ROW SET @z = 1");
     await root.query("INSERT INTO r7probe.t1 VALUES (1, 0)");
     await root.query("INSERT INTO r7probe.t2 VALUES (1, 0)");
     const shapes = [
       "UPDATE (r7probe.t1 a, r7probe.t2 b) SET b.y = 42 WHERE a.id = b.id",
+      "UPDATE (r7probe.t1 a), r7probe.t2 b SET b.y = 42 WHERE a.id = b.id",
       "UPDATE r7probe.t1 `a`, r7probe.t2 b SET b.y = 42 WHERE a.id = b.id",
       "UPDATE r7probe.t1 USE INDEX (), r7probe.t2 SET y = 42",
+      "UPDATE r7probe.t1 USE INDEX (k0,k1,k2,k3,k4,k5,k6,k7,k8,k9,k10,k11,k12,k13,k14,k15), r7probe.t2 SET y = 42",
+      "UPDATE r7probe.t1 USE INDEX FOR JOIN (k0) SET x = 42",
       "UPDATE r7probe.t1 a STRAIGHT_JOIN r7probe.t2 b ON a.id = b.id SET b.y = 42",
       "DELETE b FROM r7probe.t1 a STRAIGHT_JOIN r7probe.t2 b ON a.id = b.id",
     ];
     try {
       for (const sql of shapes) {
-        await expect(dispatchTool("sql_execute", { sql, dry_run: true }, rw)).rejects.toThrow(
-          /MyISAM|trigger/,
-        );
+        if (/USE INDEX FOR JOIN/.test(sql)) {
+          // The hint names an index, not a table: the dry run must go through.
+          const dry = (await dispatchTool("sql_execute", { sql, dry_run: true }, rw)) as any;
+          expect(dry).toMatchObject({ rolled_back: true });
+        } else {
+          await expect(dispatchTool("sql_execute", { sql, dry_run: true }, rw)).rejects.toThrow(
+            /MyISAM|trigger/,
+          );
+        }
       }
       const [[{ y }]] = (await root.query("SELECT y FROM r7probe.t2 WHERE id = 1")) as any;
       expect(Number(y)).toBe(0);

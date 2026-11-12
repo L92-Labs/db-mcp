@@ -435,6 +435,29 @@ describe("writeTargets (review round 7)", () => {
     expect(plain).toEqual([{ table: "orders" }]);
   });
 
+  it("covers closing groups before aliases, long hints and FOR JOIN hints", () => {
+    // A group closes, then the comma list continues with more tables.
+    const group = targets("UPDATE (r7.t1 a), r7.t2 b SET b.y = 42 WHERE a.id = b.id");
+    expect(group).toContainEqual({ schema: "r7", table: "t1" });
+    expect(group).toContainEqual({ schema: "r7", table: "t2" });
+    const nested = targets("UPDATE ((r7.t1 a), (r7.t2 b)) SET b.y = 42 WHERE a.id = b.id");
+    expect(nested).toContainEqual({ schema: "r7", table: "t1" });
+    expect(nested).toContainEqual({ schema: "r7", table: "t2" });
+    // Long index lists must not exhaust the hint scan.
+    const longHint = targets(
+      "UPDATE r7.t1 USE INDEX (k0,k1,k2,k3,k4,k5,k6,k7,k8,k9,k10,k11,k12,k13,k14,k15), r7.t2 SET b.y = 42",
+    );
+    expect(longHint).toContainEqual({ schema: "r7", table: "t1" });
+    expect(longHint).toContainEqual({ schema: "r7", table: "t2" });
+    // The JOIN inside USE INDEX FOR JOIN names an index, not a table.
+    expect(targets("UPDATE r7.t1 USE INDEX FOR JOIN (k0) SET x = 42")).toEqual([
+      { schema: "r7", table: "t1" },
+    ]);
+    expect(targets("DELETE FROM r7.t1 USE INDEX FOR JOIN (k0) WHERE x = 42")).toEqual([
+      { schema: "r7", table: "t1" },
+    ]);
+  });
+
   it("isInsertOrReplace detects INSERT/REPLACE statements", () => {
     const stmts = (sql: string) => splitStatements(sql, "mysql");
     expect(stmts("INSERT INTO t VALUES (1)").every(isInsertOrReplace)).toBe(true);
