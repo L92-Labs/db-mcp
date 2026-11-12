@@ -369,13 +369,20 @@ describe("writeTargets (review round 7)", () => {
     // ON DUPLICATE KEY UPDATE is not a table target.
     expect(targets("INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1")).toEqual([{ table: "t" }]);
     expect(targets("UPDATE t SET a = 1 ON DUPLICATE KEY UPDATE a = 1")).toEqual([{ table: "t" }]);
-    // UPDATE comma list with aliases.
+    // UPDATE comma list with aliases (AS or bare).
     expect(targets("UPDATE t1 AS a, t2 b SET t1.x = 1")).toEqual([{ table: "t1" }, { table: "t2" }]);
+    expect(targets("UPDATE t1 a, t2 b SET a.x = 1, b.y = 99 WHERE a.id = b.id")).toEqual([
+      { table: "t1" },
+      { table: "t2" },
+    ]);
     // JOINed tables may be updated in multi-table UPDATE.
     const joined = targets("UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.x = 1");
     expect(joined).toContainEqual({ table: "t1" });
     expect(joined).toContainEqual({ table: "t2" });
-    // DELETE alias forms include the FROM/USING tables that carry the real names.
+    const joinedAliased = targets("UPDATE t1 a LEFT JOIN t2 b ON a.id = b.id SET a.x = 1");
+    expect(joinedAliased).toContainEqual({ table: "t1" });
+    expect(joinedAliased).toContainEqual({ table: "t2" });
+    // DELETE alias forms include the FROM/USING/JOIN tables that carry the real names.
     expect(targets("DELETE x FROM t1 AS x, other t2")).toEqual([
       { table: "x" },
       { table: "t1" },
@@ -385,6 +392,18 @@ describe("writeTargets (review round 7)", () => {
       { table: "a" },
       { table: "b" },
       { table: "c" },
+    ]);
+    expect(targets("DELETE FROM t1 a1, t2 a2")).toEqual([{ table: "t1" }, { table: "t2" }]);
+    const joinDelete = targets("DELETE a1, a2 FROM t1 AS a1 JOIN t2 AS a2 ON a1.id = a2.id");
+    expect(joinDelete).toContainEqual({ table: "t1" });
+    expect(joinDelete).toContainEqual({ table: "t2" });
+    // Statement modifiers before the target list are skipped, not mistaken for tables.
+    expect(targets("UPDATE LOW_PRIORITY t SET a = 1")).toEqual([{ table: "t" }]);
+    expect(targets("DELETE QUICK t1, t2 FROM t1, t2")).toEqual([
+      { table: "t1" },
+      { table: "t2" },
+      { table: "t1" },
+      { table: "t2" },
     ]);
   });
 

@@ -214,21 +214,52 @@ export function positionalInsertTarget(tokens: Token[]): { schema?: string; tabl
 
 /**
  * Tables a MySQL statement WRITES: INSERT/REPLACE INTO, the UPDATE list (+ JOINed tables,
- * which multi-table UPDATE may update), and DELETE names (+ FROM/USING tables, whose
+ * which multi-table UPDATE may update), and DELETE names (+ FROM/USING/JOIN tables, whose
  * aliases resolve through them). Reads are excluded on purpose: engines and triggers on
  * tables the statement merely reads cannot affect whether ROLLBACK undoes the write.
  */
+const CLAUSE_KEYWORDS = new Set([
+  "SET",
+  "WHERE",
+  "ON",
+  "USING",
+  "JOIN",
+  "FROM",
+  "INTO",
+  "SELECT",
+  "VALUES",
+  "ORDER",
+  "GROUP",
+  "HAVING",
+  "LIMIT",
+  "LEFT",
+  "RIGHT",
+  "INNER",
+  "OUTER",
+  "CROSS",
+  "NATURAL",
+  "STRAIGHT_JOIN",
+  "UNION",
+  "RETURNING",
+  "AS",
+]);
+
 export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: string }> {
   const out: Array<{ schema?: string; table: string }> = [];
   const push = (t: { schema?: string; table: string } | null) => {
     if (t) out.push(t);
   };
-  /** Names in the comma list starting at `j` (aliases skipped, `AS x` allowed). */
+  /**
+   * Names in the comma list starting at `j`. A name may be followed by `AS alias` or a bare
+   * alias (`UPDATE t1 a, t2 b …`) — the alias is skipped so the list reaches the next table.
+   * Clause keywords stop the list, and are never mistaken for aliases.
+   */
   const nameList = (j: number) => {
     for (;;) {
       push(targetAfter(tokens, j));
       j = targetEnd(tokens, j);
       if (isWord(tokens[j], "AS")) j += 2;
+      else if (isWord(tokens[j]) && !CLAUSE_KEYWORDS.has((tokens[j] as { value: string }).value)) j++;
       if (isPunct(tokens[j], ",")) {
         j++;
         continue;
@@ -249,17 +280,24 @@ export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: s
     if (kw === "UPDATE") {
       // `ON DUPLICATE KEY UPDATE col = …` updates nothing by itself.
       if (isWord(tokens[i - 1], "KEY")) return;
-      nameList(i + 1);
+      let j = i + 1;
+      const skip = new Set(["LOW_PRIORITY", "IGNORE"]);
+      while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
+      nameList(j);
       tokens.forEach((w, k) => {
-        if (isWord(w, "JOIN")) push(targetAfter(tokens, k + 1));
+        if (isWord(w, "JOIN")) nameList(k + 1);
       });
       return;
     }
     if (kw === "DELETE") {
-      // `DELETE FROM t`, `DELETE t1, t2 FROM …`, `DELETE FROM t1, t2 USING …`.
-      if (!isWord(tokens[i + 1], "FROM") && !isWord(tokens[i + 1], "USING")) nameList(i + 1);
+      // `DELETE FROM t`, `DELETE t1, t2 FROM …`, `DELETE FROM t1, t2 USING …`,
+      // `DELETE a1, a2 FROM t1 AS a1 JOIN t2 AS a2 …` — aliases resolve through the lists.
+      let j = i + 1;
+      const skip = new Set(["LOW_PRIORITY", "QUICK", "IGNORE"]);
+      while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
+      if (!isWord(tokens[j], "FROM") && !isWord(tokens[j], "USING")) nameList(j);
       tokens.forEach((w, k) => {
-        if (isWord(w, "FROM") || isWord(w, "USING")) nameList(k + 1);
+        if (isWord(w, "FROM") || isWord(w, "USING") || isWord(w, "JOIN")) nameList(k + 1);
       });
       return;
     }

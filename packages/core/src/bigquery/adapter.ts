@@ -509,7 +509,8 @@ export function createBigQueryAdapter(
       );
       // Rows only name the dataset; attach the queried project so cross-project
       // allowlists (project.dataset) validate instead of falling back to the default project.
-      const queriedProject = schema || connection.defaultDataset ? datasetRef(schema).projectId : project;
+      const queriedProject =
+        schema || connection.defaultDataset ? datasetRef(schema).projectId : project;
       return bqRowsToObjects(res.schema?.fields ?? [], res.rows).map((r) => ({
         ...r,
         project_id: queriedProject,

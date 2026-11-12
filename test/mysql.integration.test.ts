@@ -358,7 +358,8 @@ describe.skipIf(!url)("mysql review fixes round 4 (live)", () => {
   });
 });
 
-describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {  it("table lookups follow the server's case sensitivity", async () => {
+describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {
+  it("table lookups follow the server's case sensitivity", async () => {
     const guarded = ctxFor("read_write", { MYSQL_HIDDEN_COLUMNS: "Customers.secret_col" });
     const root = await mysql.createConnection(url!);
     const [[{ lctn }]] = (await root.query("SELECT @@lower_case_table_names AS lctn")) as any;
@@ -422,6 +423,47 @@ describe.skipIf(!url)("mysql review fixes round 7 (live)", () => {
       rw,
     )) as any;
     expect(del.note).toBeUndefined(); // deletes consume no counter
+  });
+
+  it("a dry run refuses a non-transactional second target written through aliases", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS r7probe");
+    await root.query("CREATE TABLE r7probe.t1 (id INT, x INT) ENGINE=InnoDB");
+    await root.query("CREATE TABLE r7probe.t2 (id INT, y INT) ENGINE=MyISAM");
+    await root.query("INSERT INTO r7probe.t1 VALUES (1, 0)");
+    await root.query("INSERT INTO r7probe.t2 VALUES (1, 0)");
+    try {
+      // Aliased multi-table UPDATE: t2 is a real MyISAM target and must be checked.
+      await expect(
+        dispatchTool(
+          "sql_execute",
+          {
+            sql: "UPDATE r7probe.t1 a, r7probe.t2 b SET a.x = 1, b.y = 99 WHERE a.id = b.id",
+            dry_run: true,
+          },
+          rw,
+        ),
+      ).rejects.toThrow(/MyISAM/);
+      const [[{ y }]] = (await root.query("SELECT y FROM r7probe.t2 WHERE id = 1")) as any;
+      expect(Number(y)).toBe(0); // the dry run did not touch it
+      // Aliased JOIN delete: both real targets are resolved through the FROM/JOIN lists.
+      await expect(
+        dispatchTool(
+          "sql_execute",
+          {
+            sql: "DELETE a1, a2 FROM r7probe.t1 AS a1 JOIN r7probe.t2 AS a2 ON a1.id = a2.id",
+            dry_run: true,
+          },
+          rw,
+        ),
+      ).rejects.toThrow(/MyISAM/);
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM r7probe.t2")) as any;
+      expect(Number(n)).toBe(1);
+    } finally {
+      await root.query("DROP DATABASE r7probe");
+      await root.end();
+    }
   });
 
   it("admin CALL returns the first result set under the row cap", async () => {

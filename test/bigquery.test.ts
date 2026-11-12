@@ -492,15 +492,28 @@ describe("BigQuery scoped rules on dry-run output fields", () => {
     await expect(runA(a, "SELECT email FROM analytics.users")).rejects.toThrow(/hidden/);
   });
 
-  it("scoped rules still refuse fields when their table is referenced", async () => {
-    const a = createBigQueryAdapter(scoped, {
+  it("schema-qualified rules check the referenced dataset too", async () => {
+    const schemaScoped: BigQueryConnection = {
+      ...conn,
+      access: "read_only",
+      hiddenColumns: ["private.users.ssn"],
+    };
+    const dry = {
+      statementType: "SELECT",
+      referencedTables: [{ projectId: "proj", datasetId: "public", tableId: "users" }],
+      schema: { fields: [{ name: "ssn", type: "STRING" }] },
+    };
+    // public.users does not match private.users.ssn: visible.
+    const ok = createBigQueryAdapter(schemaScoped, { fetch: dryFetch(dry) });
+    await expect(runA(ok, "SELECT ssn FROM public.users")).resolves.toMatchObject({ row_count: 0 });
+    // private.users matches: refused.
+    const hidden = createBigQueryAdapter(schemaScoped, {
       fetch: dryFetch({
-        statementType: "SELECT",
-        referencedTables: [{ projectId: "proj", datasetId: "analytics", tableId: "users" }],
-        schema: { fields: [{ name: "email", type: "STRING" }] },
+        ...dry,
+        referencedTables: [{ projectId: "proj", datasetId: "private", tableId: "users" }],
       }),
     });
-    await expect(runA(a, "SELECT email FROM analytics.users")).rejects.toThrow(/hidden/);
+    await expect(runA(hidden, "SELECT ssn FROM private.users")).rejects.toThrow(/hidden/);
   });
 
   it("a join touching the scoped table stays refused", async () => {
