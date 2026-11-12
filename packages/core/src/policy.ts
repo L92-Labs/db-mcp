@@ -93,6 +93,29 @@ export function columnHidden(
   );
 }
 
+/**
+ * BigQuery dry-run output fields carry no origin table, so `columnHidden` would turn a scoped
+ * rule (`users.email`) into a global one. Global rules apply to every output column; scoped
+ * rules apply only when one of the dry run's referenced tables matches their scope —
+ * `SELECT email FROM orders` passes with `users.email`, a join touching `users` stays refused.
+ */
+export function outputColumnHidden(
+  policy: Policy | null,
+  column: string,
+  refs: Array<{ schema?: string; table?: string }>,
+): boolean {
+  if (!policy) return false;
+  return policy.rules.some((r) => {
+    if (!r.column.test(column)) return false;
+    if (!r.table && !r.schema) return true;
+    return refs.some(
+      (ref) =>
+        (!r.table || (!!ref.table && r.table!.test(ref.table))) &&
+        (!r.schema || (!!ref.schema && r.schema.test(ref.schema.split(".").pop()!))),
+    );
+  });
+}
+
 export function describePolicy(policy: Policy | null) {
   return policy ? { schemas: policy.schemas, hidden_columns: policy.rules.map((r) => r.source) } : null;
 }
@@ -187,6 +210,166 @@ export function positionalInsertTargets(tokens: Token[]): Array<{ schema?: strin
 /** First positional INSERT/REPLACE target, if any. */
 export function positionalInsertTarget(tokens: Token[]): { schema?: string; table: string } | null {
   return positionalInsertTargets(tokens)[0] ?? null;
+}
+
+/**
+ * Tables a MySQL statement WRITES: INSERT/REPLACE INTO, the UPDATE list (+ JOINed tables,
+ * which multi-table UPDATE may update), and DELETE names (+ FROM/USING/JOIN tables, whose
+ * aliases resolve through them). Reads are excluded on purpose: engines and triggers on
+ * tables the statement merely reads cannot affect whether ROLLBACK undoes the write.
+ */
+const CLAUSE_KEYWORDS = new Set([
+  "SET",
+  "WHERE",
+  "ON",
+  "USING",
+  "JOIN",
+  "FROM",
+  "INTO",
+  "SELECT",
+  "VALUES",
+  "ORDER",
+  "GROUP",
+  "HAVING",
+  "LIMIT",
+  "LEFT",
+  "RIGHT",
+  "INNER",
+  "OUTER",
+  "CROSS",
+  "NATURAL",
+  "STRAIGHT_JOIN",
+  "UNION",
+  "RETURNING",
+  "AS",
+]);
+
+export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: string }> {
+  const out: Array<{ schema?: string; table: string }> = [];
+  const push = (t: { schema?: string; table: string } | null) => {
+    if (t) out.push(t);
+  };
+  const HINT_STARTERS = new Set(["USE", "FORCE", "IGNORE", "PARTITION"]);
+  /** Skip an index hint / PARTITION list: words then one balanced paren group. */
+  const skipHint = (j: number): number => {
+    let parens = 0;
+    while (j < tokens.length) {
+      const t = tokens[j];
+      if (isPunct(t, "(")) parens++;
+      else if (isPunct(t, ")")) {
+        parens--;
+        j++;
+        if (parens <= 0) return j;
+        continue;
+      } else if (parens === 0 && isPunct(t, ",")) return j;
+      j++;
+    }
+    return j;
+  };
+  /**
+   * Names in the comma list starting at `j`. Handles parenthesized groups (nested), `AS
+   * alias` and bare aliases (`UPDATE t1 a, t2 b …`, quoted or not), index hints and
+   * PARTITION lists — a clause keyword stops the list and is never mistaken for an alias.
+   */
+  const nameList = (start: number) => {
+    let j = start;
+    let depth = 0;
+    for (;;) {
+      if (isPunct(tokens[j], "(")) {
+        depth++;
+        j++;
+        continue;
+      }
+      push(targetAfter(tokens, j));
+      j = targetEnd(tokens, j);
+      for (;;) {
+        const t = tokens[j];
+        if (isWord(tokens[j], "AS")) {
+          j += 2;
+          continue;
+        }
+        if (isWord(t)) {
+          const v = (t as { value: string }).value;
+          if (HINT_STARTERS.has(v)) {
+            j = skipHint(j);
+            continue;
+          }
+          if (!CLAUSE_KEYWORDS.has(v)) {
+            j++; // bare alias
+            continue;
+          }
+        }
+        if (t?.kind === "ident") {
+          j++; // quoted alias
+          continue;
+        }
+        if (depth > 0 && isPunct(t, ")")) {
+          depth--;
+          j++;
+          continue;
+        }
+        break;
+      }
+      if (isPunct(tokens[j], ",")) {
+        j++;
+        continue;
+      }
+      break;
+    }
+  };
+  /**
+   * Tables following JOIN / STRAIGHT_JOIN keywords. The `JOIN` inside an
+   * `USE INDEX FOR JOIN` hint is part of the hint, not a table join.
+   */
+  const joinTargets = () => {
+    tokens.forEach((w, k) => {
+      if (isWord(w, "JOIN")) {
+        if (isWord(tokens[k - 1], "FOR")) return;
+        nameList(k + 1);
+      } else if (isWord(w, "STRAIGHT_JOIN")) nameList(k + 1);
+    });
+  };
+  tokens.forEach((t, i) => {
+    const kw = isWord(t) ? (t as { value: string }).value : null;
+    if (!kw) return;
+    if (kw === "INSERT" || kw === "REPLACE") {
+      let j = i + 1;
+      const skip = new Set(["INTO", "IGNORE", "LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY"]);
+      while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
+      push(targetAfter(tokens, j));
+      return;
+    }
+    if (kw === "UPDATE") {
+      // `ON DUPLICATE KEY UPDATE col = …` updates nothing by itself.
+      if (isWord(tokens[i - 1], "KEY")) return;
+      let j = i + 1;
+      const skip = new Set(["LOW_PRIORITY", "IGNORE"]);
+      while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
+      nameList(j);
+      joinTargets();
+      return;
+    }
+    if (kw === "DELETE") {
+      // `DELETE FROM t`, `DELETE t1, t2 FROM …`, `DELETE FROM t1, t2 USING …`,
+      // `DELETE a1, a2 FROM t1 AS a1 JOIN t2 AS a2 …` — aliases resolve through the lists.
+      let j = i + 1;
+      const skip = new Set(["LOW_PRIORITY", "QUICK", "IGNORE"]);
+      while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
+      if (!isWord(tokens[j], "FROM") && !isWord(tokens[j], "USING")) nameList(j);
+      tokens.forEach((w, k) => {
+        if (isWord(w, "FROM") || isWord(w, "USING")) nameList(k + 1);
+      });
+      joinTargets();
+      return;
+    }
+  });
+  return out;
+}
+
+/** True when the statement starts with INSERT or REPLACE (dry-run auto-increment disclosure). */
+export function isInsertOrReplace(tokens: Token[]): boolean {
+  const t = tokens[0];
+  return !!t && t.kind === "word" && (t.value === "INSERT" || t.value === "REPLACE");
 }
 
 /** `MERGE [INTO] t … INSERT ROW | INSERT VALUES (…)` writes every column positionally. */

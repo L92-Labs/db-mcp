@@ -1,4 +1,4 @@
-import { columnHidden, policyFor, schemaAllowed } from "../policy.js";
+import { columnHidden, outputColumnHidden, policyFor, schemaAllowed } from "../policy.js";
 import { classAllowed, maxClass, qualifierTokens, splitStatements } from "../sql/classify.js";
 import type {
   BigQueryConnection,
@@ -241,8 +241,10 @@ export function createBigQueryAdapter(
         }
       }
     }
+    // Output fields name no source table: scoped rules need the referenced tables as context.
+    const refs = (q?.referencedTables ?? []).map((t) => ({ schema: t.datasetId, table: t.tableId }));
     for (const f of flattenFields(q?.schema?.fields ?? [])) {
-      if (f.name.split(".").some((part) => columnHidden(policy, { column: part }))) {
+      if (f.name.split(".").some((part) => outputColumnHidden(policy, part, refs))) {
         throw new Error(`result column ${f.name} is hidden on connection "${connection.name}"`);
       }
     }
@@ -505,7 +507,14 @@ export function createBigQueryAdapter(
         limit,
         30_000,
       );
-      return bqRowsToObjects(res.schema?.fields ?? [], res.rows);
+      // Rows only name the dataset; attach the queried project so cross-project
+      // allowlists (project.dataset) validate instead of falling back to the default project.
+      const queriedProject =
+        schema || connection.defaultDataset ? datasetRef(schema).projectId : project;
+      return bqRowsToObjects(res.schema?.fields ?? [], res.rows).map((r) => ({
+        ...r,
+        project_id: queriedProject,
+      }));
     },
 
     run,

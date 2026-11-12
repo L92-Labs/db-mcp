@@ -377,3 +377,186 @@ describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {
     }
   });
 });
+
+describe.skipIf(!url)("mysql review fixes round 7 (live)", () => {
+  it("an unrelated same-named table in another schema no longer blocks a dry run", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS elsewhere");
+    await root.query("CREATE TABLE IF NOT EXISTS elsewhere.status (id INT) ENGINE=MyISAM");
+    await root.query("CREATE TABLE IF NOT EXISTS elsewhere.orders (id INT) ENGINE=MyISAM");
+    // Triggers live in the schema of their table: switch before creating.
+    await root.query("USE elsewhere");
+    await root.query(
+      "CREATE TRIGGER IF NOT EXISTS orders_ai AFTER INSERT ON orders FOR EACH ROW SET @x = 1",
+    );
+    await root.query("USE shop");
+    try {
+      // `orders` is written; `status` is only a column name. elsewhere.orders (MyISAM, trigger)
+      // shares the name but is not touched by the statement.
+      const dry = (await dispatchTool(
+        "sql_execute",
+        { sql: "UPDATE orders SET status = 'done' WHERE id = 1", dry_run: true },
+        rw,
+      )) as any;
+      expect(dry).toMatchObject({ dry_run: true, rolled_back: true });
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM elsewhere.orders")) as any;
+      expect(Number(n)).toBe(0); // the dry run did not touch the unrelated table
+    } finally {
+      await root.query("DROP DATABASE elsewhere");
+      await root.end();
+    }
+  });
+
+  it("dry-run inserts disclose auto-increment consumption", async () => {
+    const rw = ctxFor("read_write");
+    const ins = (await dispatchTool(
+      "sql_execute",
+      { sql: "INSERT INTO customers (email, name) VALUES ('r7@example.com', 'R7')", dry_run: true },
+      rw,
+    )) as any;
+    expect(ins).toMatchObject({ dry_run: true, rolled_back: true });
+    expect(ins.note).toMatch(/auto-increment counters \(shop\.customers\)/);
+    const del = (await dispatchTool(
+      "sql_execute",
+      { sql: "DELETE FROM customers WHERE email = 'r7@example.com'", dry_run: true },
+      rw,
+    )) as any;
+    expect(del.note).toBeUndefined(); // deletes consume no counter
+  });
+
+  it("a dry run refuses a non-transactional second target written through aliases", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS r7probe");
+    await root.query("CREATE TABLE r7probe.t1 (id INT, x INT) ENGINE=InnoDB");
+    await root.query("CREATE TABLE r7probe.t2 (id INT, y INT) ENGINE=MyISAM");
+    await root.query("INSERT INTO r7probe.t1 VALUES (1, 0)");
+    await root.query("INSERT INTO r7probe.t2 VALUES (1, 0)");
+    try {
+      // Aliased multi-table UPDATE: t2 is a real MyISAM target and must be checked.
+      await expect(
+        dispatchTool(
+          "sql_execute",
+          {
+            sql: "UPDATE r7probe.t1 a, r7probe.t2 b SET a.x = 1, b.y = 99 WHERE a.id = b.id",
+            dry_run: true,
+          },
+          rw,
+        ),
+      ).rejects.toThrow(/MyISAM/);
+      const [[{ y }]] = (await root.query("SELECT y FROM r7probe.t2 WHERE id = 1")) as any;
+      expect(Number(y)).toBe(0); // the dry run did not touch it
+      // Aliased JOIN delete: both real targets are resolved through the FROM/JOIN lists.
+      await expect(
+        dispatchTool(
+          "sql_execute",
+          {
+            sql: "DELETE a1, a2 FROM r7probe.t1 AS a1 JOIN r7probe.t2 AS a2 ON a1.id = a2.id",
+            dry_run: true,
+          },
+          rw,
+        ),
+      ).rejects.toThrow(/MyISAM/);
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM r7probe.t2")) as any;
+      expect(Number(n)).toBe(1);
+    } finally {
+      await root.query("DROP DATABASE r7probe");
+      await root.end();
+    }
+  });
+
+  it("a dry run refuses non-transactional targets through parens, hints and STRAIGHT_JOIN", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS r7probe");
+    // k0…k15 indexes so USE INDEX shapes are valid SQL.
+    const indexes = Array.from({ length: 16 }, (_, i) => `INDEX k${i} (id)`).join(", ");
+    await root.query(`CREATE TABLE r7probe.t1 (id INT, x INT, ${indexes}) ENGINE=InnoDB`);
+    await root.query("CREATE TABLE r7probe.t2 (id INT, y INT) ENGINE=MyISAM");
+    await root.query("CREATE TRIGGER r7probe.t2_bi BEFORE UPDATE ON r7probe.t2 FOR EACH ROW SET @z = 1");
+    await root.query("INSERT INTO r7probe.t1 VALUES (1, 0)");
+    await root.query("INSERT INTO r7probe.t2 VALUES (1, 0)");
+    const shapes = [
+      "UPDATE (r7probe.t1 a, r7probe.t2 b) SET b.y = 42 WHERE a.id = b.id",
+      "UPDATE (r7probe.t1 a), r7probe.t2 b SET b.y = 42 WHERE a.id = b.id",
+      "UPDATE r7probe.t1 `a`, r7probe.t2 b SET b.y = 42 WHERE a.id = b.id",
+      "UPDATE r7probe.t1 USE INDEX (), r7probe.t2 SET y = 42",
+      "UPDATE r7probe.t1 USE INDEX (k0,k1,k2,k3,k4,k5,k6,k7,k8,k9,k10,k11,k12,k13,k14,k15), r7probe.t2 SET y = 42",
+      "UPDATE r7probe.t1 USE INDEX FOR JOIN (k0) SET x = 42",
+      "UPDATE r7probe.t1 a STRAIGHT_JOIN r7probe.t2 b ON a.id = b.id SET b.y = 42",
+      "DELETE b FROM r7probe.t1 a STRAIGHT_JOIN r7probe.t2 b ON a.id = b.id",
+    ];
+    try {
+      for (const sql of shapes) {
+        if (/USE INDEX FOR JOIN/.test(sql)) {
+          // The hint names an index, not a table: the dry run must go through.
+          const dry = (await dispatchTool("sql_execute", { sql, dry_run: true }, rw)) as any;
+          expect(dry).toMatchObject({ rolled_back: true });
+        } else {
+          await expect(dispatchTool("sql_execute", { sql, dry_run: true }, rw)).rejects.toThrow(
+            /MyISAM|trigger/,
+          );
+        }
+      }
+      const [[{ y }]] = (await root.query("SELECT y FROM r7probe.t2 WHERE id = 1")) as any;
+      expect(Number(y)).toBe(0);
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM r7probe.t2")) as any;
+      expect(Number(n)).toBe(1);
+    } finally {
+      await root.query("DROP DATABASE r7probe");
+      await root.end();
+    }
+  });
+
+  it("CALL result sets do not include OK packets as phantom rows", async () => {
+    const adm = ctxFor("admin");
+    const root = await mysql.createConnection(url!);
+    await root.query(
+      "CREATE PROCEDURE IF NOT EXISTS shop.one_row() BEGIN SELECT 7 AS n; END",
+    );
+    await root.query(
+      "CREATE PROCEDURE IF NOT EXISTS shop.none_row() BEGIN SELECT 1 AS n FROM DUAL WHERE 1 = 0; END",
+    );
+    try {
+      const one = (await dispatchTool("sql_execute", { sql: "CALL one_row()", max_rows: 5 }, adm)) as any;
+      expect(one.rows).toEqual([{ n: "7" }]);
+      expect(one.truncated).toBe(false);
+      const capped = (await dispatchTool("sql_execute", { sql: "CALL one_row()", max_rows: 1 }, adm)) as any;
+      expect(capped).toMatchObject({ row_count: 1, truncated: false }); // OK packet is not a second row
+      const none = (await dispatchTool("sql_execute", { sql: "CALL none_row()", max_rows: 5 }, adm)) as any;
+      expect(none.rows).toEqual([]); // empty result set stays empty
+    } finally {
+      await root.query("DROP PROCEDURE IF EXISTS shop.one_row");
+      await root.query("DROP PROCEDURE IF EXISTS shop.none_row");
+      await root.end();
+    }
+  });
+
+  it("admin CALL returns the first result set under the row cap", async () => {
+    const adm = ctxFor("admin");
+    const root = await mysql.createConnection(url!);
+    await root.query(
+      "INSERT INTO shop.customers (email, name) VALUES ('call1@example.com', 'C1'), ('call2@example.com', 'C2'), ('call3@example.com', 'C3')",
+    );
+    await root.query(
+      "CREATE PROCEDURE IF NOT EXISTS shop.report() BEGIN SELECT id, email FROM customers LIMIT 5; SELECT 1 AS second; END",
+    );
+    try {
+      const capped = (await dispatchTool("sql_execute", { sql: "CALL report()", max_rows: 3 }, adm)) as any;
+      expect(capped.columns.map((c: any) => c.name)).toEqual(["id", "email"]); // procedure rows, not wrappers
+      expect(capped.row_count).toBe(3);
+      expect(capped.truncated).toBe(true);
+      expect(capped.rows.every((r: any) => typeof r.email === "string")).toBe(true);
+      expect(capped.rows.some((r: any) => r.second !== undefined)).toBe(false); // later set drained, not mixed in
+      const small = (await dispatchTool("sql_execute", { sql: "CALL report()", max_rows: 2 }, adm)) as any;
+      expect(small).toMatchObject({ row_count: 2, truncated: true });
+    } finally {
+      await root.query(
+        "DELETE FROM shop.customers WHERE email IN ('call1@example.com', 'call2@example.com', 'call3@example.com')",
+      );
+      await root.query("DROP PROCEDURE IF EXISTS shop.report");
+      await root.end();
+    }
+  });
+});
