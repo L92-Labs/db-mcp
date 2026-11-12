@@ -407,6 +407,34 @@ describe("writeTargets (review round 7)", () => {
     ]);
   });
 
+  it("covers parenthesized lists, quoted aliases, hints and STRAIGHT_JOIN", () => {
+    // Parenthesized table lists (MySQL 8.0.19+).
+    const paren = targets("UPDATE (r7.a a, r7.b b) SET b.x = 42 WHERE a.id = b.id");
+    expect(paren).toContainEqual({ schema: "r7", table: "a" });
+    expect(paren).toContainEqual({ schema: "r7", table: "b" });
+    // Quoted alias after the first table must not stop the comma list.
+    const quoted = targets("UPDATE r7.a `a`, r7.b b SET b.x = 42 WHERE a.id = b.id");
+    expect(quoted).toContainEqual({ schema: "r7", table: "a" });
+    expect(quoted).toContainEqual({ schema: "r7", table: "b" });
+    // Index hints and PARTITION selection sit between the table and the comma.
+    const hinted = targets("UPDATE r7.a USE INDEX (), r7.b FORCE INDEX (k) PARTITION (p0) SET b.x = 42");
+    expect(hinted).toContainEqual({ schema: "r7", table: "a" });
+    expect(hinted).toContainEqual({ schema: "r7", table: "b" });
+    // STRAIGHT_JOIN is a join keyword in UPDATE and DELETE.
+    const straight = targets("UPDATE r7.a a STRAIGHT_JOIN r7.b b ON a.id = b.id SET b.x = 42");
+    expect(straight).toContainEqual({ schema: "r7", table: "a" });
+    expect(straight).toContainEqual({ schema: "r7", table: "b" });
+    const straightDelete = targets("DELETE b FROM r7.a a STRAIGHT_JOIN r7.b b ON a.id = b.id");
+    expect(straightDelete).toContainEqual({ schema: "r7", table: "b" });
+    expect(targets("DELETE FROM r7.a STRAIGHT_JOIN r7.b ON r7.a.id = r7.b.id")).toContainEqual({
+      schema: "r7",
+      table: "b",
+    });
+    // ON-clause keywords stop alias scanning, so ON expressions add nothing.
+    const plain = targets("UPDATE orders SET status = 'done' WHERE (a, b) = (1, 2)");
+    expect(plain).toEqual([{ table: "orders" }]);
+  });
+
   it("isInsertOrReplace detects INSERT/REPLACE statements", () => {
     const stmts = (sql: string) => splitStatements(sql, "mysql");
     expect(stmts("INSERT INTO t VALUES (1)").every(isInsertOrReplace)).toBe(true);

@@ -249,17 +249,68 @@ export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: s
   const push = (t: { schema?: string; table: string } | null) => {
     if (t) out.push(t);
   };
+  const HINT_STARTERS = new Set(["USE", "FORCE", "IGNORE", "PARTITION"]);
+  /** Skip an index hint / PARTITION list: words then one balanced paren group. */
+  const skipHint = (j: number): number => {
+    let seen = 0;
+    let parens = 0;
+    while (j < tokens.length && seen < 24) {
+      const t = tokens[j];
+      if (isPunct(t, "(")) parens++;
+      else if (isPunct(t, ")")) {
+        parens--;
+        j++;
+        if (parens <= 0) return j;
+        continue;
+      } else if (parens === 0 && isPunct(t, ",")) return j;
+      j++;
+      seen++;
+    }
+    return j;
+  };
   /**
-   * Names in the comma list starting at `j`. A name may be followed by `AS alias` or a bare
-   * alias (`UPDATE t1 a, t2 b …`) — the alias is skipped so the list reaches the next table.
-   * Clause keywords stop the list, and are never mistaken for aliases.
+   * Names in the comma list starting at `j`. Handles parenthesized lists, `AS alias` and
+   * bare aliases (`UPDATE t1 a, t2 b …`, quoted or not), index hints and PARTITION lists —
+   * a clause keyword stops the list and is never mistaken for an alias.
    */
-  const nameList = (j: number) => {
+  const nameList = (start: number) => {
+    let j = start;
+    let listed = false;
     for (;;) {
+      if (isPunct(tokens[j], "(")) {
+        listed = true;
+        j++;
+        continue;
+      }
       push(targetAfter(tokens, j));
       j = targetEnd(tokens, j);
-      if (isWord(tokens[j], "AS")) j += 2;
-      else if (isWord(tokens[j]) && !CLAUSE_KEYWORDS.has((tokens[j] as { value: string }).value)) j++;
+      if (listed && isPunct(tokens[j], ")")) {
+        j++;
+        listed = false;
+      }
+      for (;;) {
+        const t = tokens[j];
+        if (isWord(tokens[j], "AS")) {
+          j += 2;
+          continue;
+        }
+        if (isWord(t)) {
+          const v = (t as { value: string }).value;
+          if (HINT_STARTERS.has(v)) {
+            j = skipHint(j);
+            continue;
+          }
+          if (!CLAUSE_KEYWORDS.has(v)) {
+            j++; // bare alias
+            continue;
+          }
+        }
+        if (t?.kind === "ident") {
+          j++; // quoted alias
+          continue;
+        }
+        break;
+      }
       if (isPunct(tokens[j], ",")) {
         j++;
         continue;
@@ -285,7 +336,7 @@ export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: s
       while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
       nameList(j);
       tokens.forEach((w, k) => {
-        if (isWord(w, "JOIN")) nameList(k + 1);
+        if (isWord(w, "JOIN") || isWord(w, "STRAIGHT_JOIN")) nameList(k + 1);
       });
       return;
     }
@@ -297,7 +348,8 @@ export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: s
       while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
       if (!isWord(tokens[j], "FROM") && !isWord(tokens[j], "USING")) nameList(j);
       tokens.forEach((w, k) => {
-        if (isWord(w, "FROM") || isWord(w, "USING") || isWord(w, "JOIN")) nameList(k + 1);
+        if (isWord(w, "FROM") || isWord(w, "USING") || isWord(w, "JOIN") || isWord(w, "STRAIGHT_JOIN"))
+          nameList(k + 1);
       });
       return;
     }

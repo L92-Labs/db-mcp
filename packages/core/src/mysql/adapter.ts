@@ -17,7 +17,8 @@ import type {
 /** Event-emitting query of the underlying (non-promise) mysql2 connection, used to stream rows. */
 type CoreQuery = {
   on(event: "fields", cb: (fields: FieldPacket[]) => void): CoreQuery;
-  on(event: "result", cb: (row: unknown) => void): CoreQuery;
+  /** Rows carry their result-set index; OK packets arrive without one. */
+  on(event: "result", cb: (row: unknown, resultIndex?: number) => void): CoreQuery;
   on(event: "error", cb: (error: Error) => void): CoreQuery;
   on(event: "end", cb: () => void): CoreQuery;
 };
@@ -207,10 +208,12 @@ export function createMySqlAdapter(
             finish(() => reject(error));
           }
         })
-        .on("result", (row) => {
+        .on("result", (row, index) => {
           if (settled) return;
-          if (!fields) {
-            header = row; // OK packet (DML) — no result set
+          // mysql2 emits rows as (row, resultIndex) but OK packets as (header) with no index:
+          // a CALL's final OK packet must not become a phantom data row.
+          if (!fields || index === undefined) {
+            header = row; // OK packet (DML or statement status) — no result set
             return;
           }
           if (draining) return;

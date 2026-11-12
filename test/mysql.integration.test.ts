@@ -466,6 +466,62 @@ describe.skipIf(!url)("mysql review fixes round 7 (live)", () => {
     }
   });
 
+  it("a dry run refuses non-transactional targets through parens, hints and STRAIGHT_JOIN", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS r7probe");
+    await root.query("CREATE TABLE r7probe.t1 (id INT, x INT) ENGINE=InnoDB");
+    await root.query("CREATE TABLE r7probe.t2 (id INT, y INT) ENGINE=MyISAM");
+    await root.query("CREATE TRIGGER r7probe.t2_bi BEFORE UPDATE ON r7probe.t2 FOR EACH ROW SET @z = 1");
+    await root.query("INSERT INTO r7probe.t1 VALUES (1, 0)");
+    await root.query("INSERT INTO r7probe.t2 VALUES (1, 0)");
+    const shapes = [
+      "UPDATE (r7probe.t1 a, r7probe.t2 b) SET b.y = 42 WHERE a.id = b.id",
+      "UPDATE r7probe.t1 `a`, r7probe.t2 b SET b.y = 42 WHERE a.id = b.id",
+      "UPDATE r7probe.t1 USE INDEX (), r7probe.t2 SET y = 42",
+      "UPDATE r7probe.t1 a STRAIGHT_JOIN r7probe.t2 b ON a.id = b.id SET b.y = 42",
+      "DELETE b FROM r7probe.t1 a STRAIGHT_JOIN r7probe.t2 b ON a.id = b.id",
+    ];
+    try {
+      for (const sql of shapes) {
+        await expect(dispatchTool("sql_execute", { sql, dry_run: true }, rw)).rejects.toThrow(
+          /MyISAM|trigger/,
+        );
+      }
+      const [[{ y }]] = (await root.query("SELECT y FROM r7probe.t2 WHERE id = 1")) as any;
+      expect(Number(y)).toBe(0);
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM r7probe.t2")) as any;
+      expect(Number(n)).toBe(1);
+    } finally {
+      await root.query("DROP DATABASE r7probe");
+      await root.end();
+    }
+  });
+
+  it("CALL result sets do not include OK packets as phantom rows", async () => {
+    const adm = ctxFor("admin");
+    const root = await mysql.createConnection(url!);
+    await root.query(
+      "CREATE PROCEDURE IF NOT EXISTS shop.one_row() BEGIN SELECT 7 AS n; END",
+    );
+    await root.query(
+      "CREATE PROCEDURE IF NOT EXISTS shop.none_row() BEGIN SELECT 1 AS n FROM DUAL WHERE 1 = 0; END",
+    );
+    try {
+      const one = (await dispatchTool("sql_execute", { sql: "CALL one_row()", max_rows: 5 }, adm)) as any;
+      expect(one.rows).toEqual([{ n: "7" }]);
+      expect(one.truncated).toBe(false);
+      const capped = (await dispatchTool("sql_execute", { sql: "CALL one_row()", max_rows: 1 }, adm)) as any;
+      expect(capped).toMatchObject({ row_count: 1, truncated: false }); // OK packet is not a second row
+      const none = (await dispatchTool("sql_execute", { sql: "CALL none_row()", max_rows: 5 }, adm)) as any;
+      expect(none.rows).toEqual([]); // empty result set stays empty
+    } finally {
+      await root.query("DROP PROCEDURE IF EXISTS shop.one_row");
+      await root.query("DROP PROCEDURE IF EXISTS shop.none_row");
+      await root.end();
+    }
+  });
+
   it("admin CALL returns the first result set under the row cap", async () => {
     const adm = ctxFor("admin");
     const root = await mysql.createConnection(url!);
