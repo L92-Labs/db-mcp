@@ -358,8 +358,7 @@ describe.skipIf(!url)("mysql review fixes round 4 (live)", () => {
   });
 });
 
-describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {
-  it("table lookups follow the server's case sensitivity", async () => {
+describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {  it("table lookups follow the server's case sensitivity", async () => {
     const guarded = ctxFor("read_write", { MYSQL_HIDDEN_COLUMNS: "Customers.secret_col" });
     const root = await mysql.createConnection(url!);
     const [[{ lctn }]] = (await root.query("SELECT @@lower_case_table_names AS lctn")) as any;
@@ -373,6 +372,81 @@ describe.skipIf(!url)("mysql review fixes round 6 (live)", () => {
       expect(d.name).toBe("customers");
     } finally {
       await root.query("DROP TABLE shop.Customers");
+      await root.end();
+    }
+  });
+});
+
+describe.skipIf(!url)("mysql review fixes round 7 (live)", () => {
+  it("an unrelated same-named table in another schema no longer blocks a dry run", async () => {
+    const rw = ctxFor("read_write");
+    const root = await mysql.createConnection(url!);
+    await root.query("CREATE DATABASE IF NOT EXISTS elsewhere");
+    await root.query("CREATE TABLE IF NOT EXISTS elsewhere.status (id INT) ENGINE=MyISAM");
+    await root.query("CREATE TABLE IF NOT EXISTS elsewhere.orders (id INT) ENGINE=MyISAM");
+    // Triggers live in the schema of their table: switch before creating.
+    await root.query("USE elsewhere");
+    await root.query(
+      "CREATE TRIGGER IF NOT EXISTS orders_ai AFTER INSERT ON orders FOR EACH ROW SET @x = 1",
+    );
+    await root.query("USE shop");
+    try {
+      // `orders` is written; `status` is only a column name. elsewhere.orders (MyISAM, trigger)
+      // shares the name but is not touched by the statement.
+      const dry = (await dispatchTool(
+        "sql_execute",
+        { sql: "UPDATE orders SET status = 'done' WHERE id = 1", dry_run: true },
+        rw,
+      )) as any;
+      expect(dry).toMatchObject({ dry_run: true, rolled_back: true });
+      const [[{ n }]] = (await root.query("SELECT COUNT(*) AS n FROM elsewhere.orders")) as any;
+      expect(Number(n)).toBe(0); // the dry run did not touch the unrelated table
+    } finally {
+      await root.query("DROP DATABASE elsewhere");
+      await root.end();
+    }
+  });
+
+  it("dry-run inserts disclose auto-increment consumption", async () => {
+    const rw = ctxFor("read_write");
+    const ins = (await dispatchTool(
+      "sql_execute",
+      { sql: "INSERT INTO customers (email, name) VALUES ('r7@example.com', 'R7')", dry_run: true },
+      rw,
+    )) as any;
+    expect(ins).toMatchObject({ dry_run: true, rolled_back: true });
+    expect(ins.note).toMatch(/auto-increment counters \(shop\.customers\)/);
+    const del = (await dispatchTool(
+      "sql_execute",
+      { sql: "DELETE FROM customers WHERE email = 'r7@example.com'", dry_run: true },
+      rw,
+    )) as any;
+    expect(del.note).toBeUndefined(); // deletes consume no counter
+  });
+
+  it("admin CALL returns the first result set under the row cap", async () => {
+    const adm = ctxFor("admin");
+    const root = await mysql.createConnection(url!);
+    await root.query(
+      "INSERT INTO shop.customers (email, name) VALUES ('call1@example.com', 'C1'), ('call2@example.com', 'C2'), ('call3@example.com', 'C3')",
+    );
+    await root.query(
+      "CREATE PROCEDURE IF NOT EXISTS shop.report() BEGIN SELECT id, email FROM customers LIMIT 5; SELECT 1 AS second; END",
+    );
+    try {
+      const capped = (await dispatchTool("sql_execute", { sql: "CALL report()", max_rows: 3 }, adm)) as any;
+      expect(capped.columns.map((c: any) => c.name)).toEqual(["id", "email"]); // procedure rows, not wrappers
+      expect(capped.row_count).toBe(3);
+      expect(capped.truncated).toBe(true);
+      expect(capped.rows.every((r: any) => typeof r.email === "string")).toBe(true);
+      expect(capped.rows.some((r: any) => r.second !== undefined)).toBe(false); // later set drained, not mixed in
+      const small = (await dispatchTool("sql_execute", { sql: "CALL report()", max_rows: 2 }, adm)) as any;
+      expect(small).toMatchObject({ row_count: 2, truncated: true });
+    } finally {
+      await root.query(
+        "DELETE FROM shop.customers WHERE email IN ('call1@example.com', 'call2@example.com', 'call3@example.com')",
+      );
+      await root.query("DROP PROCEDURE IF EXISTS shop.report");
       await root.end();
     }
   });

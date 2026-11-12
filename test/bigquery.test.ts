@@ -412,4 +412,110 @@ describe("BigQuery cross-project allowlist", () => {
       /allowlist/,
     );
   });
+
+  it("columns_search keeps rows from an explicitly allowlisted cross-project dataset", async () => {
+    const queryJson = {
+      jobComplete: true,
+      schema: {
+        fields: [
+          { name: "schema", type: "STRING" },
+          { name: "table", type: "STRING" },
+          { name: "column", type: "STRING" },
+          { name: "type", type: "STRING" },
+        ],
+      },
+      rows: [{ f: [{ v: "analytics" }, { v: "users" }, { v: "email" }, { v: "STRING" }] }],
+    };
+    const f = (async () => new Response(JSON.stringify(queryJson), { status: 200 })) as typeof fetch;
+    const config = loadRuntimeConfig({
+      BIGQUERY_PROJECT_ID: "other-project",
+      BIGQUERY_ACCESS_TOKEN: "t",
+      BIGQUERY_DATASETS: "allowed-project.analytics",
+    });
+    const ctx = createDispatchContext(config, (c) =>
+      createBigQueryAdapter(c as BigQueryConnection, { fetch: f }),
+    );
+    for (const args of [{ schema: "allowed-project.analytics", pattern: "email" }, { pattern: "email" }]) {
+      const r = (await dispatchTool("columns_search", args, ctx)) as any;
+      expect(r.count).toBe(1);
+      expect(r.columns[0]).toMatchObject({
+        schema: "analytics",
+        table: "users",
+        column: "email",
+        project_id: "allowed-project",
+      });
+    }
+  });
+});
+
+describe("BigQuery scoped rules on dry-run output fields", () => {
+  const scoped: BigQueryConnection = { ...conn, access: "read_only", hiddenColumns: ["users.email"] };
+  const runA = (a: ReturnType<typeof createBigQueryAdapter>, sql: string) =>
+    a.run({ sql, maxRows: 10, timeoutMs: 1000, allow: "read", classified: "read" });
+
+  function dryFetch(dry: Record<string, unknown>): typeof fetch {
+    return (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/queries")) {
+        const fields = (dry as { schema?: { fields?: unknown[] } }).schema?.fields ?? [];
+        return new Response(
+          JSON.stringify({ jobComplete: true, schema: { fields }, rows: [], totalRows: "0" }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ statistics: { query: dry } }), { status: 200 });
+    }) as typeof fetch;
+  }
+
+  it("a table-scoped rule does not hit fields of unrelated tables", async () => {
+    const a = createBigQueryAdapter(scoped, {
+      fetch: dryFetch({
+        statementType: "SELECT",
+        referencedTables: [{ projectId: "proj", datasetId: "analytics", tableId: "orders" }],
+        schema: { fields: [{ name: "email", type: "STRING" }] },
+      }),
+    });
+    await expect(runA(a, "SELECT email FROM analytics.orders")).resolves.toMatchObject({
+      row_count: 0,
+      columns: [{ name: "email", type: "STRING" }],
+    });
+  });
+
+  it("scoped rules still refuse fields when their table is referenced", async () => {
+    const a = createBigQueryAdapter(scoped, {
+      fetch: dryFetch({
+        statementType: "SELECT",
+        referencedTables: [{ projectId: "proj", datasetId: "analytics", tableId: "users" }],
+        schema: { fields: [{ name: "email", type: "STRING" }] },
+      }),
+    });
+    await expect(runA(a, "SELECT email FROM analytics.users")).rejects.toThrow(/hidden/);
+  });
+
+  it("scoped rules still refuse fields when their table is referenced", async () => {
+    const a = createBigQueryAdapter(scoped, {
+      fetch: dryFetch({
+        statementType: "SELECT",
+        referencedTables: [{ projectId: "proj", datasetId: "analytics", tableId: "users" }],
+        schema: { fields: [{ name: "email", type: "STRING" }] },
+      }),
+    });
+    await expect(runA(a, "SELECT email FROM analytics.users")).rejects.toThrow(/hidden/);
+  });
+
+  it("a join touching the scoped table stays refused", async () => {
+    const a = createBigQueryAdapter(scoped, {
+      fetch: dryFetch({
+        statementType: "SELECT",
+        referencedTables: [
+          { projectId: "proj", datasetId: "analytics", tableId: "orders" },
+          { projectId: "proj", datasetId: "analytics", tableId: "users" },
+        ],
+        schema: { fields: [{ name: "email", type: "STRING" }] },
+      }),
+    });
+    await expect(
+      runA(a, "SELECT o.email FROM analytics.orders o JOIN analytics.users u ON o.user_id = u.id"),
+    ).rejects.toThrow(/hidden/);
+  });
 });

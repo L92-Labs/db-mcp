@@ -312,7 +312,12 @@ export async function dispatchTool(name: string, args: unknown, ctx: DispatchCon
       }
       const columns = found.filter(
         (c) =>
-          schemaAllowed(policy, c.schema as string) &&
+          // BigQuery rows carry the queried project; check `project.dataset` together
+          // so a cross-project allowlist entry does not collapse onto the default project.
+          schemaAllowed(
+            policy,
+            typeof c.project_id === "string" ? `${c.project_id}.${c.schema}` : (c.schema as string),
+          ) &&
           !columnHidden(policy, {
             schema: c.schema as string,
             table: c.table as string,

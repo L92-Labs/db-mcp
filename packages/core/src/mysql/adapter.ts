@@ -1,7 +1,7 @@
 import mysql from "mysql2/promise";
 import type { ConnectionOptions, FieldPacket, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { likePattern, toJsonValue } from "../format.js";
-import { columnHidden, mentionsHidden, policyFor, schemaAllowed } from "../policy.js";
+import { columnHidden, isInsertOrReplace, mentionsHidden, policyFor, schemaAllowed, writeTargets } from "../policy.js";
 import { classAllowed, identifierTokens, qualifierTokens, splitStatements } from "../sql/classify.js";
 import type {
   ColumnMeta,
@@ -167,6 +167,8 @@ export function createMySqlAdapter(
   /**
    * Stream rows and stop after `cap`: an explicit `LIMIT 100000000` overrides sql_select_limit,
    * so the client must not buffer the whole result. Stopping destroys the connection.
+   * `firstResultSetOnly` (admin CALL): later result sets are still drained in full —
+   * only the first one's rows are retained, so memory stays bounded by `keep`.
    */
   function streamQuery(
     client: MySqlClient,
@@ -176,12 +178,14 @@ export function createMySqlAdapter(
     keep: number,
     timeout: number,
     onFields: (fields: FieldPacket[]) => void,
+    firstResultSetOnly = false,
   ): Promise<{ raw: unknown; fields: FieldPacket[] | undefined; aborted: boolean }> {
     return new Promise((resolve, reject) => {
       const rows: unknown[] = [];
       let fields: FieldPacket[] | undefined;
       let header: unknown;
       let seen = 0;
+      let draining = false;
       let settled = false;
       const finish = (fn: () => void) => {
         if (settled) return;
@@ -191,6 +195,10 @@ export function createMySqlAdapter(
       (client.connection.query({ sql, values, timeout }) as CoreQuery)
         .on("fields", (f) => {
           if (!Array.isArray(f)) return; // OK packets (DML) report no columns
+          if (fields && firstResultSetOnly) {
+            draining = true; // a procedure's second result set: keep draining, drop rows
+            return;
+          }
           fields = f;
           try {
             onFields(f);
@@ -205,6 +213,7 @@ export function createMySqlAdapter(
             header = row; // OK packet (DML) — no result set
             return;
           }
+          if (draining) return;
           seen++;
           if (rows.length < keep) rows.push(row); // drained rows past `keep` are discarded
           if (seen >= cap) {
@@ -368,24 +377,40 @@ export function createMySqlAdapter(
   }
 
   /**
-   * ROLLBACK cannot undo MyISAM/MEMORY/ARCHIVE writes, nor what triggers do. A dry run is only
-   * honest when every table the statement names is transactional and none has triggers.
+   * ROLLBACK cannot undo MyISAM/MEMORY/ARCHIVE writes, trigger side effects, or AUTO_INCREMENT
+   * counters. Resolve the tables the statement actually WRITES — not every identifier, which
+   * would let an unrelated same-named table elsewhere block an honest dry run — then verify
+   * each. Returns the extra result fields a dry run must disclose (auto-increment consumption).
    */
-  async function assertRollbackSafe(client: MySqlClient, sql: string): Promise<void> {
-    const names = [
-      ...new Set(
-        splitStatements(sql, "mysql")
-          .flatMap(identifierTokens)
-          .map((n) => n.toLowerCase()),
-      ),
+  async function assertRollbackSafe(client: MySqlClient, sql: string): Promise<Partial<QueryResult>> {
+    const statements = splitStatements(sql, "mysql");
+    const targets = [...new Map(statements.flatMap(writeTargets).map((t) => [`${t.schema ?? ""}.${t.table}`, t])).values()];
+    if (targets.length === 0) return {};
+    const folds = await detectCaseFolding(client);
+    const [[dbRow]] = await q<RowDataPacket[]>(client, "SELECT DATABASE() AS db");
+    const currentDb = (dbRow?.db as string | null) ?? null;
+    // Unqualified names live in the session's default database; without one they cannot execute.
+    const resolved = [
+      ...new Map(
+        targets
+          .map((t) => ({ schema: t.schema ?? currentDb, table: t.table }))
+          .filter((t): t is { schema: string; table: string } => t.schema !== null)
+          .map((t) => [folds ? `${t.schema}.${t.table}`.toLowerCase() : `${t.schema}.${t.table}`, t]),
+      ).values(),
     ];
-    if (names.length === 0) return;
+    if (resolved.length === 0) return {};
+    const cmp = folds ? "LOWER(TABLE_SCHEMA), LOWER(TABLE_NAME)" : "TABLE_SCHEMA, TABLE_NAME";
+    const pairValues = resolved.flatMap((t) =>
+      folds ? [t.schema.toLowerCase(), t.table.toLowerCase()] : [t.schema, t.table],
+    );
+    const tuples = resolved.map(() => "(?, ?)").join(", ");
     const tables = await metaQuery<{ schema: string; name: string; type: string; engine: string | null }>(
       client,
       `SELECT TABLE_SCHEMA AS \`schema\`, TABLE_NAME AS name, TABLE_TYPE AS type, ENGINE AS engine
        FROM information_schema.TABLES
-       WHERE LOWER(TABLE_NAME) IN (?) AND TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')`,
-      [names],
+       WHERE (${cmp}) IN (${tuples})
+         AND TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')`,
+      pairValues,
     );
     for (const t of tables) {
       if (t.type === "VIEW") {
@@ -402,17 +427,41 @@ export function createMySqlAdapter(
         );
       }
     }
-    const triggers = await metaQuery<{ name: string; table: string }>(
-      client,
-      `SELECT TRIGGER_NAME AS name, EVENT_OBJECT_TABLE AS \`table\` FROM information_schema.TRIGGERS
-       WHERE LOWER(EVENT_OBJECT_TABLE) IN (?)`,
-      [names],
-    );
-    if (triggers.length > 0) {
-      throw new Error(
-        `dry_run is refused: ${triggers[0]!.table} has trigger ${triggers[0]!.name}, whose side effects may not roll back`,
+    const written = tables.filter((t) => t.type === "BASE TABLE");
+    if (written.length > 0) {
+      const triggers = await metaQuery<{ name: string; schema: string; table: string }>(
+        client,
+        `SELECT TRIGGER_NAME AS name, EVENT_OBJECT_SCHEMA AS \`schema\`, EVENT_OBJECT_TABLE AS \`table\`
+         FROM information_schema.TRIGGERS
+         WHERE (EVENT_OBJECT_SCHEMA, EVENT_OBJECT_TABLE) IN (${written.map(() => "(?, ?)").join(", ")})`,
+        written.flatMap((t) => [t.schema, t.name]),
       );
+      if (triggers.length > 0) {
+        const t0 = triggers[0]!;
+        throw new Error(
+          `dry_run is refused: ${t0.schema}.${t0.table} has trigger ${t0.name}, whose side effects may not roll back`,
+        );
+      }
+      // AUTO_INCREMENT counters advance even inside a rolled-back transaction (documented).
+      if (statements.some(isInsertOrReplace)) {
+        const autoInc = await metaQuery<{ schema: string; name: string }>(
+          client,
+          `SELECT DISTINCT TABLE_SCHEMA AS \`schema\`, TABLE_NAME AS name
+           FROM information_schema.COLUMNS
+           WHERE EXTRA LIKE '%auto_increment%'
+             AND (TABLE_SCHEMA, TABLE_NAME) IN (${written.map(() => "(?, ?)").join(", ")})`,
+          written.flatMap((t) => [t.schema, t.name]),
+        );
+        if (autoInc.length > 0) {
+          return {
+            note: `rolled back, except auto-increment counters (${autoInc
+              .map((t) => `${t.schema}.${t.name}`)
+              .join(", ")}): generated values stay consumed`,
+          };
+        }
+      }
     }
+    return {};
   }
 
   /** After running (before COMMIT): result columns must come from allowed schemas and not be hidden. */
@@ -495,7 +544,8 @@ export function createMySqlAdapter(
       let open = true;
       try {
         await enforceSql(client, sql);
-        if (mode === "dry_run") await assertRollbackSafe(client, sql);
+        const dryExtras: Partial<QueryResult> =
+          mode === "dry_run" ? { rolled_back: true, ...(await assertRollbackSafe(client, sql)) } : {};
         // Writes are never cut short: stopping early would roll back a statement the caller expects committed.
         const cap = cls === "read" ? maxRows + 1 : Number.POSITIVE_INFINITY;
         const res = await streamQuery(client, sql, values, cap, maxRows + 1, timeoutMs + 5_000, (fields) =>
@@ -508,7 +558,7 @@ export function createMySqlAdapter(
           await q(client, mode === "write" ? "COMMIT" : "ROLLBACK");
           open = false;
         }
-        return shape(res.raw, res.fields, maxRows, cls, { ...extra, duration_ms: Date.now() - started });
+        return shape(res.raw, res.fields, maxRows, cls, { ...extra, ...dryExtras, duration_ms: Date.now() - started });
       } finally {
         if (open) await q(client, "ROLLBACK").catch(() => undefined);
         await q(client, "SET SESSION sql_select_limit = DEFAULT").catch(() => undefined);
@@ -755,18 +805,30 @@ export function createMySqlAdapter(
           input.maxRows,
           input.timeoutMs,
           input.classified,
-          input.dryRun ? { rolled_back: true } : {},
         );
       }
       if (policy) throw new Error("admin statements are disabled on connections with a schema/column policy");
       if (input.dryRun) {
         throw new Error("MySQL DDL commits implicitly, so admin statements cannot be dry-run");
       }
-      // admin DDL: autocommit, one statement.
+      // admin DDL / CALL: autocommit, one statement. Streamed so a procedure's result sets
+      // cannot buffer without bound: everything drains to completion, but only the first
+      // result set's rows (up to max_rows + 1) are retained and returned.
       return withClient(async (client) => {
         await prepareSession(client, input.timeoutMs, null);
-        const [raw, fields] = await q<unknown>(client, input.sql, values, input.timeoutMs + 5_000);
-        return shape(raw, fields, input.maxRows, input.classified, { duration_ms: Date.now() - started });
+        const res = await streamQuery(
+          client,
+          input.sql,
+          values,
+          Number.POSITIVE_INFINITY,
+          input.maxRows + 1,
+          input.timeoutMs + 5_000,
+          () => {}, // admin connections carry no policy (refused above)
+          true,
+        );
+        return shape(res.raw, res.fields, input.maxRows, input.classified, {
+          duration_ms: Date.now() - started,
+        });
       });
     },
 

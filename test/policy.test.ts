@@ -4,8 +4,10 @@ import {
   capAccess,
   classifySql,
   columnHidden,
+  isInsertOrReplace,
   limitRows,
   loadRuntimeConfig,
+  outputColumnHidden,
   policyFor,
   assertSqlPolicy,
   hasStarProjection,
@@ -15,6 +17,7 @@ import {
   positionalMergeTarget,
   schemaAllowed,
   splitStatements,
+  writeTargets,
   type ConnectionConfig,
 } from "@db-mcp/core";
 
@@ -343,5 +346,77 @@ describe("policy (review round 6)", () => {
     expect(() => check("SELECT 'secret.vault'::regclass")).toThrow(/regclass/);
     expect(() => check("SELECT pg_relation_size('secret.vault')")).toThrow(/pg_relation_size/);
     expect(() => check("SELECT pg_get_viewdef('secret.v')")).toThrow(/pg_get_viewdef/);
+  });
+});
+
+describe("writeTargets (review round 7)", () => {
+  const targets = (sql: string) => splitStatements(sql, "mysql").flatMap(writeTargets);
+
+  it("collects the tables a statement writes, not every identifier", () => {
+    expect(targets("INSERT INTO shop.orders (a) VALUES (1)")).toEqual([{ schema: "shop", table: "orders" }]);
+    expect(targets("REPLACE INTO orders VALUES (1)")).toEqual([{ table: "orders" }]);
+    expect(targets("DELETE FROM orders WHERE id = 1")).toEqual([{ table: "orders" }]);
+    // Column names / aliases / values are not targets.
+    expect(targets("UPDATE orders SET status = 'done' WHERE customer_id = 3")).toEqual([
+      { table: "orders" },
+    ]);
+    expect(targets("INSERT INTO orders (id, status) SELECT id, note FROM orders")).toEqual([
+      { table: "orders" },
+    ]);
+  });
+
+  it("covers multi-table forms without unrelated names", () => {
+    // ON DUPLICATE KEY UPDATE is not a table target.
+    expect(targets("INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1")).toEqual([{ table: "t" }]);
+    expect(targets("UPDATE t SET a = 1 ON DUPLICATE KEY UPDATE a = 1")).toEqual([{ table: "t" }]);
+    // UPDATE comma list with aliases.
+    expect(targets("UPDATE t1 AS a, t2 b SET t1.x = 1")).toEqual([{ table: "t1" }, { table: "t2" }]);
+    // JOINed tables may be updated in multi-table UPDATE.
+    const joined = targets("UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.x = 1");
+    expect(joined).toContainEqual({ table: "t1" });
+    expect(joined).toContainEqual({ table: "t2" });
+    // DELETE alias forms include the FROM/USING tables that carry the real names.
+    expect(targets("DELETE x FROM t1 AS x, other t2")).toEqual([
+      { table: "x" },
+      { table: "t1" },
+      { table: "other" },
+    ]);
+    expect(targets("DELETE FROM a, b USING c WHERE a.id = c.id")).toEqual([
+      { table: "a" },
+      { table: "b" },
+      { table: "c" },
+    ]);
+  });
+
+  it("isInsertOrReplace detects INSERT/REPLACE statements", () => {
+    const stmts = (sql: string) => splitStatements(sql, "mysql");
+    expect(stmts("INSERT INTO t VALUES (1)").every(isInsertOrReplace)).toBe(true);
+    expect(stmts("REPLACE INTO t VALUES (1)").every(isInsertOrReplace)).toBe(true);
+    expect(stmts("UPDATE t SET a = 1").every((s) => !isInsertOrReplace(s))).toBe(true);
+  });
+});
+
+describe("outputColumnHidden (review round 7)", () => {
+  const policy = policyFor(conn({ hiddenColumns: ["users.email", "private.users.ssn", "api_token"] }))!;
+
+  it("applies scoped rules only through referenced tables", () => {
+    expect(outputColumnHidden(policy, "email", [{ schema: "analytics", table: "orders" }])).toBe(false);
+    expect(outputColumnHidden(policy, "email", [{ schema: "analytics", table: "users" }])).toBe(true);
+    // A join touching the scoped table stays refused.
+    expect(
+      outputColumnHidden(policy, "email", [
+        { schema: "analytics", table: "orders" },
+        { schema: "analytics", table: "users" },
+      ]),
+    ).toBe(true);
+    // Schema-qualified rules check the dataset too.
+    expect(outputColumnHidden(policy, "ssn", [{ schema: "public", table: "users" }])).toBe(false);
+    expect(outputColumnHidden(policy, "ssn", [{ schema: "private", table: "users" }])).toBe(true);
+  });
+
+  it("global rules apply without context", () => {
+    expect(outputColumnHidden(policy, "api_token", [])).toBe(true);
+    expect(outputColumnHidden(policy, "email", [])).toBe(false);
+    expect(outputColumnHidden(null, "api_token", [{ table: "users" }])).toBe(false);
   });
 });

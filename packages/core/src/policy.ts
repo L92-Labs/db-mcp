@@ -93,6 +93,29 @@ export function columnHidden(
   );
 }
 
+/**
+ * BigQuery dry-run output fields carry no origin table, so `columnHidden` would turn a scoped
+ * rule (`users.email`) into a global one. Global rules apply to every output column; scoped
+ * rules apply only when one of the dry run's referenced tables matches their scope —
+ * `SELECT email FROM orders` passes with `users.email`, a join touching `users` stays refused.
+ */
+export function outputColumnHidden(
+  policy: Policy | null,
+  column: string,
+  refs: Array<{ schema?: string; table?: string }>,
+): boolean {
+  if (!policy) return false;
+  return policy.rules.some((r) => {
+    if (!r.column.test(column)) return false;
+    if (!r.table && !r.schema) return true;
+    return refs.some(
+      (ref) =>
+        (!r.table || (!!ref.table && r.table!.test(ref.table))) &&
+        (!r.schema || (!!ref.schema && r.schema.test(ref.schema.split(".").pop()!))),
+    );
+  });
+}
+
 export function describePolicy(policy: Policy | null) {
   return policy ? { schemas: policy.schemas, hidden_columns: policy.rules.map((r) => r.source) } : null;
 }
@@ -187,6 +210,67 @@ export function positionalInsertTargets(tokens: Token[]): Array<{ schema?: strin
 /** First positional INSERT/REPLACE target, if any. */
 export function positionalInsertTarget(tokens: Token[]): { schema?: string; table: string } | null {
   return positionalInsertTargets(tokens)[0] ?? null;
+}
+
+/**
+ * Tables a MySQL statement WRITES: INSERT/REPLACE INTO, the UPDATE list (+ JOINed tables,
+ * which multi-table UPDATE may update), and DELETE names (+ FROM/USING tables, whose
+ * aliases resolve through them). Reads are excluded on purpose: engines and triggers on
+ * tables the statement merely reads cannot affect whether ROLLBACK undoes the write.
+ */
+export function writeTargets(tokens: Token[]): Array<{ schema?: string; table: string }> {
+  const out: Array<{ schema?: string; table: string }> = [];
+  const push = (t: { schema?: string; table: string } | null) => {
+    if (t) out.push(t);
+  };
+  /** Names in the comma list starting at `j` (aliases skipped, `AS x` allowed). */
+  const nameList = (j: number) => {
+    for (;;) {
+      push(targetAfter(tokens, j));
+      j = targetEnd(tokens, j);
+      if (isWord(tokens[j], "AS")) j += 2;
+      if (isPunct(tokens[j], ",")) {
+        j++;
+        continue;
+      }
+      break;
+    }
+  };
+  tokens.forEach((t, i) => {
+    const kw = isWord(t) ? (t as { value: string }).value : null;
+    if (!kw) return;
+    if (kw === "INSERT" || kw === "REPLACE") {
+      let j = i + 1;
+      const skip = new Set(["INTO", "IGNORE", "LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY"]);
+      while (isWord(tokens[j]) && skip.has((tokens[j] as { value: string }).value)) j++;
+      push(targetAfter(tokens, j));
+      return;
+    }
+    if (kw === "UPDATE") {
+      // `ON DUPLICATE KEY UPDATE col = …` updates nothing by itself.
+      if (isWord(tokens[i - 1], "KEY")) return;
+      nameList(i + 1);
+      tokens.forEach((w, k) => {
+        if (isWord(w, "JOIN")) push(targetAfter(tokens, k + 1));
+      });
+      return;
+    }
+    if (kw === "DELETE") {
+      // `DELETE FROM t`, `DELETE t1, t2 FROM …`, `DELETE FROM t1, t2 USING …`.
+      if (!isWord(tokens[i + 1], "FROM") && !isWord(tokens[i + 1], "USING")) nameList(i + 1);
+      tokens.forEach((w, k) => {
+        if (isWord(w, "FROM") || isWord(w, "USING")) nameList(k + 1);
+      });
+      return;
+    }
+  });
+  return out;
+}
+
+/** True when the statement starts with INSERT or REPLACE (dry-run auto-increment disclosure). */
+export function isInsertOrReplace(tokens: Token[]): boolean {
+  const t = tokens[0];
+  return !!t && t.kind === "word" && (t.value === "INSERT" || t.value === "REPLACE");
 }
 
 /** `MERGE [INTO] t … INSERT ROW | INSERT VALUES (…)` writes every column positionally. */

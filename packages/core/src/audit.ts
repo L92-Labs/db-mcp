@@ -39,6 +39,26 @@ async function sha256(text: string): Promise<string> {
 
 const MAX_AUDIT_SQL = 4_000;
 
+/**
+ * Driver/transport errors (pg SQLSTATE, mysql2 `ER_*` and `E*` codes, BigQuery HTTP) carry
+ * structured codes; db-mcp's own guardrail errors are plain messages without driver codes.
+ * Driver text can echo SQL fragments or bound values, so `meta` mode keeps only a stable code.
+ */
+function driverErrorCode(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  const e = error as Error & { code?: unknown; errno?: unknown };
+  if (typeof e.code === "string" && e.code) return e.code;
+  if (e.errno !== undefined && Number.isFinite(Number(e.errno))) return String(e.errno);
+  const status = /^BigQuery (\d{3}): /.exec(e.message);
+  return status ? status[1]! : null;
+}
+
+function isDriverError(error: unknown): boolean {
+  if (!(error instanceof Error)) return true; // drivers may throw non-Error values
+  if (driverErrorCode(error) !== null) return true;
+  return (error as Error & { severity?: unknown }).severity !== undefined; // pg error objects
+}
+
 export async function buildAuditEntry(opts: {
   mode: AuditMode;
   principal: string;
@@ -78,7 +98,13 @@ export async function buildAuditEntry(opts: {
     if (opts.mode === "sql") entry.sql = sql.length > MAX_AUDIT_SQL ? `${sql.slice(0, MAX_AUDIT_SQL)}…` : sql;
   }
   if (opts.error !== undefined) {
-    entry.error = (opts.error instanceof Error ? opts.error.message : String(opts.error)).slice(0, 500);
+    const raw = opts.error instanceof Error ? opts.error.message : String(opts.error);
+    if (opts.mode === "meta" && isDriverError(opts.error)) {
+      const code = driverErrorCode(opts.error);
+      entry.error = `database error${code ? ` ${code}` : ""} (set DB_AUDIT_LOG=sql for the message)`;
+    } else {
+      entry.error = raw.slice(0, 500);
+    }
   }
   return entry;
 }
