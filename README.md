@@ -62,135 +62,6 @@ To roll back, set the previous version/digest and repeat those commands.
 Inspect status/logs with `docker compose -f docker-compose.image.yml ps` and
 `docker compose -f docker-compose.image.yml logs --tail=100 db-mcp`.
 
-## Engines
-
-Both runtimes share the same code. Postgres uses `pg` and MySQL uses `mysql2`; both run on Workers with `nodejs_compat`. BigQuery talks to the REST API with a service-account JWT signed by WebCrypto (no Google SDK).
-
-<!-- source: BigQuery cells name the vars the shorthand connection reads (packages/core/src/config.ts); the other cells are unchanged. -->
-| | Postgres | MySQL 8 (MariaDB: best effort, untested) | BigQuery |
-|--|--|--|--|
-| Node / Docker | `url` | `url` | `BIGQUERY_*` vars |
-| Workers | Hyperdrive or `url` | Hyperdrive or `url` | `BIGQUERY_*` secrets |
-| Read-only enforced by the engine | `BEGIN READ ONLY` | `START TRANSACTION READ ONLY` | dry-run `statementType` |
-| `dry_run` writes | transaction + rollback | transaction + rollback (not DDL) | dry-run job (bytes, no row count) |
-
-## Tools
-
-| Tool | What it does |
-|------|--------------|
-| `connections_list` | Configured connections: engine, access level, policy, default |
-| `connection_info` | Ping + server version, database/project, current user, read-only state |
-| `schemas_list` | Schemas (Postgres), databases (MySQL), datasets (BigQuery) |
-| `tables_list` | Tables and views (kind, estimated rows, size), filter by name |
-| `table_describe` | Columns, types, nullability, defaults, comments, PK/FK, indexes, referencing tables, partitioning/clustering, view SQL |
-| `table_sample` | First N rows, visible columns only (BigQuery uses `tabledata.list`, which bills nothing) |
-| `columns_search` | Find columns by name across tables |
-| `sql_query` | One **read-only** statement. Always read-only, whatever the connection allows |
-| `sql_explain` | Plan without executing (Postgres/MySQL `EXPLAIN FORMAT JSON`); BigQuery dry run (bytes, statement type) |
-| `sql_execute` | Writes, up to the connection's access level; `dry_run: true` previews and rolls back. **Only registered when some connection is not read-only** |
-
-Bind parameters: Postgres `$1, $2…` from `params: [...]`; MySQL `?` from `params: [...]`; BigQuery `?` from `params: [...]` or `@name` from `params: {...}` (a value can be `{"type": "DATE", "value": "2024-01-01"}`).
-
-## Access levels
-
-Set `DB_ACCESS` for every connection, and override it per connection with `"access"` in `DB_CONNECTIONS_JSON` (or `DATABASE_ACCESS` / `MYSQL_ACCESS` / `BIGQUERY_ACCESS`).
-
-| Access | Allows |
-|--------|--------|
-| `read_only` (default) | `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `EXPLAIN`, `DESCRIBE` |
-| `read_write` | + `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `REPLACE` (one statement per call, in a transaction) |
-| `admin` | + DDL, `GRANT`, `VACUUM`, `CALL`; on Postgres also multi-statement scripts |
-
-Each statement is checked twice:
-
-1. **SQL classifier** (all engines). Comments, strings and dollar quotes are stripped; MySQL `/*! … */` executable comments are read as code. A call holds one statement (Postgres `admin` excepted). Data-modifying CTEs, `SELECT … INTO`, `EXPLAIN ANALYZE <write>` and side-effect functions are refused when access is too low (`pg_terminate_backend`, `set_config`, `dblink`, `LOAD_FILE`, `GET_LOCK`…).
-2. **Engine enforcement**
-   - **Postgres**: reads run in `BEGIN TRANSACTION READ ONLY` with `SET LOCAL statement_timeout`, through the extended protocol, which accepts one statement only. Rows stream through a cursor.
-   - **MySQL**: reads run in `START TRANSACTION READ ONLY`. `sql_select_limit` caps the rows the server sends, and `max_execution_time` (MariaDB: `max_statement_time`) caps the time. `multipleStatements` is always off. MySQL DDL commits implicitly, so the classifier is what keeps DDL out.
-   - **BigQuery**: every statement is dry-run first (free). Its `statementType` must fit the access level. `max_bytes_billed` caps cost.
-
-For defense in depth, also use a **read-only database user** for read-only connections. For BigQuery, give the service account only `roles/bigquery.dataViewer` + `roles/bigquery.jobUser`.
-
-## Guardrails: schema allowlist and hidden columns
-
-Per connection: `"schemas": ["public", "shop"]` and `"hidden_columns": ["password", "users.ssn", "*token*"]`. Shorthand env vars: `DATABASE_SCHEMAS`, `MYSQL_SCHEMAS`, `BIGQUERY_DATASETS`, `*_HIDDEN_COLUMNS`. `DB_HIDDEN_COLUMNS` applies to every connection.
-
-- **Metadata**: other schemas and hidden columns disappear from `schemas_list`, `tables_list`, `table_describe` and `columns_search`. `table_sample` selects only visible columns.
-- **SQL**: any identifier matching a hidden pattern is refused. Then the engine checks what the statement really touches:
-  - Postgres: `search_path` is pinned to the allowlist. `EXPLAIN (VERBOSE)` is inspected for every scanned relation and the columns read from it, which catches `SELECT *`, aliases and `row_to_json(t)`.
-  - MySQL: schema-qualified names are checked against the server's schema list, and each result column's origin (`db`, `orgTable`, `orgName`) is checked before commit.
-  - BigQuery: the dry run's referenced tables and output schema are checked.
-- Admin statements are disabled on a connection that has a policy.
-- Not a security boundary for SQL hidden inside functions or procedures: use database grants (column privileges, views) for hard guarantees.
-
-## Response budget
-
-`DB_MAX_ROWS` (default 200) caps rows. `DB_MAX_RESULT_BYTES` (default 100 000) caps the JSON size, and rows past it are dropped (`truncated_by: "bytes"`). `DB_MAX_CELL_CHARS` (default 2 000) cuts long strings and JSON cells. All three keep agents from flooding their context.
-
-## Audit log
-
-`DB_AUDIT_LOG=meta` (default) writes one JSON line per tool call. Each line has principal (`stdio`, `bearer`, `github:<login>`, `password`), tool, connection, statement class, command, rows, affected rows, dry-run flag, duration, error and `sql_sha256`. Use `sql` to include the SQL text, `off` to disable. Node writes to **stderr** (stdout carries stdio MCP). Workers write to Workers Logs (`[observability] enabled = true`).
-
-## Configure
-
-Copy [`.env.example`](.env.example) to `.env` (Node/Docker), or [`apps/worker/.dev.vars.example`](apps/worker/.dev.vars.example) to `apps/worker/.dev.vars`.
-
-```bash
-# simplest: one database, read-only
-DATABASE_URL=postgres://readonly:pw@db:5432/app     # or MYSQL_URL=mysql://…
-DB_ACCESS=read_only
-MCP_BEARER_TOKEN=long-random-string
-
-# several named connections
-DB_CONNECTIONS_JSON='{
-  "app":       {"engine":"postgres","url":"postgres://…","access":"read_write","description":"main app",
-                "schemas":["public"],"hidden_columns":["users.password_hash","*token*"]},
-  "legacy":    {"engine":"mysql","url":"mysql://…","ssl":"require"},
-  "warehouse": {"engine":"bigquery","project_id":"my-proj","location":"EU",
-                "credentials_json":"<base64 or raw key JSON>","default_dataset":"analytics",
-                "max_bytes_billed":"10000000000","schemas":["analytics"]}
-}'
-DB_DEFAULT_CONNECTION=app
-```
-
-A connection with both `url` and `hyperdrive` works everywhere: Workers use the Hyperdrive binding, Node/Docker use the url.
-
-All settings, in one table. Where: `all` = every runtime, `Node` = Node and the Docker image, `Compose` = `docker-compose.image.yml`, `Workers` = the Worker only.
-
-<!-- source: names and defaults from packages/core/src/config.ts; Node rows from apps/node/src/index.ts, apps/node/src/adapters.ts and the dotenv default path; Compose rows from docker-compose.image.yml; Worker rows from apps/worker/wrangler.toml, apps/worker/src/env.ts, apps/worker/src/index.ts and apps/worker/src/oauth.ts. -->
-| Var | Default | Where | What it controls |
-|-----|---------|-------|------------------|
-| `MCP_BEARER_TOKEN` | none | all | Required for HTTP / Docker; on Workers always accepted |
-| `DB_ACCESS` | `read_only` | all | Default access level (`read_only`, `read_write`, `admin`; aliases `ro`, `rw`) |
-| `DB_MAX_ROWS` / `DB_MAX_RESULT_BYTES` / `DB_MAX_CELL_CHARS` | `200` / `100000` / `2000` | all | Response budget |
-| `DB_STATEMENT_TIMEOUT_MS` | `30000` | all | Per-statement timeout |
-| `DB_AUDIT_LOG` | `meta` | all | `off`, `meta`, `sql` |
-| `DB_HIDDEN_COLUMNS` | none | all | Hidden column globs for every connection |
-| `DB_CONNECTIONS_JSON` | none | all | Several named connections; replaces the single-connection vars below |
-| `DB_DEFAULT_CONNECTION` | first connection defined | all | Connection used when a tool call names none |
-| `DATABASE_URL` / `MYSQL_URL` / `BIGQUERY_PROJECT_ID` | none | all | One connection each for Postgres, MySQL and BigQuery, named `postgres`, `mysql`, `bigquery` |
-| `DATABASE_SSL` / `MYSQL_SSL` | none | all | TLS for that connection: `require`, `no-verify`, `disable` |
-| `DATABASE_ACCESS` / `MYSQL_ACCESS` / `BIGQUERY_ACCESS` | `DB_ACCESS` | all | Access level for that one connection |
-| `DATABASE_SCHEMAS` / `MYSQL_SCHEMAS` / `BIGQUERY_DATASETS` | none | all | Schema or dataset allowlist for that one connection |
-| `DATABASE_HIDDEN_COLUMNS` / `MYSQL_HIDDEN_COLUMNS` / `BIGQUERY_HIDDEN_COLUMNS` | none | all | Hidden columns for that one connection |
-| `BIGQUERY_CREDENTIALS_JSON` / `BIGQUERY_ACCESS_TOKEN` | none | all | Service-account key (raw JSON or base64), or an access token for local tests |
-| `BIGQUERY_LOCATION` / `BIGQUERY_DEFAULT_DATASET` / `BIGQUERY_MAX_BYTES_BILLED` | none | all | See [BigQuery setup](#bigquery-setup) |
-| `MYSQL_HYPERDRIVE` | none | Workers | Hyperdrive binding for the `mysql` connection |
-| `MCP_TRANSPORT` | `stdio` | Node | `stdio` or `http`; the Docker image sets `http` |
-| `PORT` | `8787` | Node | HTTP listen port |
-| `DB_ENV_FILE` | `.env` in the working directory | Node | Path of the env file to load |
-| `DB_POOL_MAX` | `5` | Node | Pool size per connection |
-| `DB_MCP_IMAGE` | `ghcr.io/l92-labs/db-mcp:latest` | Compose | Image to pull: a tag, or `@sha256:<digest>` |
-| `TUNNEL_TOKEN` | none | Compose | Cloudflare Tunnel token for `--profile tunnel` |
-| `AUTH_MODE` | `bearer` | Workers | `bearer` or `oauth` |
-| `OAUTH_LOGIN` | `password` (`github` when `GITHUB_CLIENT_ID` is set) | Workers | Sign-in method for OAuth: `github` or `password` |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | none | Workers | GitHub OAuth app used for sign-in |
-| `OAUTH_ALLOWED_USERS` | none | Workers | Comma-separated GitHub logins allowed to sign in |
-| `OAUTH_PASSWORD` | none | Workers | Sign-in password for `OAUTH_LOGIN=password`, 16+ chars |
-| `HYPERDRIVE` (binding) | none | Workers | Postgres binding; becomes connection `postgres` when `DATABASE_URL` and `DB_CONNECTIONS_JSON` are unset |
-| `HYPERDRIVE_MYSQL` (binding) | none | Workers | Optional MySQL binding, used through `MYSQL_HYPERDRIVE` or `"hyperdrive"` in `DB_CONNECTIONS_JSON` |
-| `OAUTH_KV` (binding) | none | Workers | KV namespace; required when `AUTH_MODE=oauth` |
-
 ## Node / stdio (Claude Desktop, Cursor, Claude Code)
 
 <!-- source: CONTRIBUTING.md ("Use Node 22 and the pnpm version pinned in package.json") -->
@@ -264,6 +135,66 @@ The static `MCP_BEARER_TOKEN` keeps working for CLI clients.
 
 Scopes: `db:read` (always granted) and `db:write`, which the user can tick on the consent page. A token without `db:write` sees every connection as `read_only`, so `sql_execute` disappears. In claude.ai: Settings → Connectors → Add custom connector → `https://<worker>/mcp`.
 
+## Configure
+
+Copy [`.env.example`](.env.example) to `.env` (Node/Docker), or [`apps/worker/.dev.vars.example`](apps/worker/.dev.vars.example) to `apps/worker/.dev.vars`.
+
+```bash
+# simplest: one database, read-only
+DATABASE_URL=postgres://readonly:pw@db:5432/app     # or MYSQL_URL=mysql://…
+DB_ACCESS=read_only
+MCP_BEARER_TOKEN=long-random-string
+
+# several named connections
+DB_CONNECTIONS_JSON='{
+  "app":       {"engine":"postgres","url":"postgres://…","access":"read_write","description":"main app",
+                "schemas":["public"],"hidden_columns":["users.password_hash","*token*"]},
+  "legacy":    {"engine":"mysql","url":"mysql://…","ssl":"require"},
+  "warehouse": {"engine":"bigquery","project_id":"my-proj","location":"EU",
+                "credentials_json":"<base64 or raw key JSON>","default_dataset":"analytics",
+                "max_bytes_billed":"10000000000","schemas":["analytics"]}
+}'
+DB_DEFAULT_CONNECTION=app
+```
+
+A connection with both `url` and `hyperdrive` works everywhere: Workers use the Hyperdrive binding, Node/Docker use the url.
+
+All settings, in one table. Where: `all` = every runtime, `Node` = Node and the Docker image, `Compose` = `docker-compose.image.yml`, `Workers` = the Worker only.
+
+<!-- source: names and defaults from packages/core/src/config.ts; Node rows from apps/node/src/index.ts, apps/node/src/adapters.ts and the dotenv default path; Compose rows from docker-compose.image.yml; Worker rows from apps/worker/wrangler.toml, apps/worker/src/env.ts, apps/worker/src/index.ts and apps/worker/src/oauth.ts. -->
+| Var | Default | Where | What it controls |
+|-----|---------|-------|------------------|
+| `MCP_BEARER_TOKEN` | none | all | Required for HTTP / Docker; on Workers always accepted |
+| `DB_ACCESS` | `read_only` | all | Default access level (`read_only`, `read_write`, `admin`; aliases `ro`, `rw`) |
+| `DB_MAX_ROWS` / `DB_MAX_RESULT_BYTES` / `DB_MAX_CELL_CHARS` | `200` / `100000` / `2000` | all | Response budget |
+| `DB_STATEMENT_TIMEOUT_MS` | `30000` | all | Per-statement timeout |
+| `DB_AUDIT_LOG` | `meta` | all | `off`, `meta`, `sql` |
+| `DB_HIDDEN_COLUMNS` | none | all | Hidden column globs for every connection |
+| `DB_CONNECTIONS_JSON` | none | all | Several named connections; replaces the single-connection vars below |
+| `DB_DEFAULT_CONNECTION` | first connection defined | all | Connection used when a tool call names none |
+| `DATABASE_URL` / `MYSQL_URL` / `BIGQUERY_PROJECT_ID` | none | all | One connection each for Postgres, MySQL and BigQuery, named `postgres`, `mysql`, `bigquery` |
+| `DATABASE_SSL` / `MYSQL_SSL` | none | all | TLS for that connection: `require`, `no-verify`, `disable` |
+| `DATABASE_ACCESS` / `MYSQL_ACCESS` / `BIGQUERY_ACCESS` | `DB_ACCESS` | all | Access level for that one connection |
+| `DATABASE_SCHEMAS` / `MYSQL_SCHEMAS` / `BIGQUERY_DATASETS` | none | all | Schema or dataset allowlist for that one connection |
+| `DATABASE_HIDDEN_COLUMNS` / `MYSQL_HIDDEN_COLUMNS` / `BIGQUERY_HIDDEN_COLUMNS` | none | all | Hidden columns for that one connection |
+| `BIGQUERY_CREDENTIALS_JSON` / `BIGQUERY_ACCESS_TOKEN` | none | all | Service-account key (raw JSON or base64), or an access token for local tests |
+| `BIGQUERY_LOCATION` / `BIGQUERY_DEFAULT_DATASET` / `BIGQUERY_MAX_BYTES_BILLED` | none | all | See [BigQuery setup](#bigquery-setup) |
+| `MYSQL_HYPERDRIVE` | none | Workers | Hyperdrive binding for the `mysql` connection |
+| `MCP_TRANSPORT` | `stdio` | Node | `stdio` or `http`; the Docker image sets `http` |
+| `PORT` | `8787` | Node | HTTP listen port |
+| `DB_ENV_FILE` | `.env` in the working directory | Node | Path of the env file to load |
+| `DB_POOL_MAX` | `5` | Node | Pool size per connection |
+| `DB_MCP_IMAGE` | `ghcr.io/l92-labs/db-mcp:latest` | Compose | Image to pull: a tag, or `@sha256:<digest>` |
+| `TUNNEL_TOKEN` | none | Compose | Cloudflare Tunnel token for `--profile tunnel` |
+| `AUTH_MODE` | `bearer` | Workers | `bearer` or `oauth` |
+| `OAUTH_LOGIN` | `password` (`github` when `GITHUB_CLIENT_ID` is set) | Workers | Sign-in method for OAuth: `github` or `password` |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | none | Workers | GitHub OAuth app used for sign-in |
+| `OAUTH_ALLOWED_USERS` | none | Workers | Comma-separated GitHub logins allowed to sign in |
+| `OAUTH_PASSWORD` | none | Workers | Sign-in password for `OAUTH_LOGIN=password`, 16+ chars |
+| `HYPERDRIVE` (binding) | none | Workers | Postgres binding; becomes connection `postgres` when `DATABASE_URL` and `DB_CONNECTIONS_JSON` are unset |
+| `HYPERDRIVE_MYSQL` (binding) | none | Workers | Optional MySQL binding, used through `MYSQL_HYPERDRIVE` or `"hyperdrive"` in `DB_CONNECTIONS_JSON` |
+| `OAUTH_KV` (binding) | none | Workers | KV namespace; required when `AUTH_MODE=oauth` |
+
 ## BigQuery setup
 
 1. Create a service account. For read-only, grant `roles/bigquery.dataViewer` + `roles/bigquery.jobUser`; for writes, add `roles/bigquery.dataEditor`.
@@ -272,6 +203,77 @@ Scopes: `db:read` (always granted) and `db:write`, which the user can tick on th
 4. Set `max_bytes_billed` to cap cost per query. Use `sql_explain` to see the bytes before running.
 
 For quick local tests, `access_token` (`BIGQUERY_ACCESS_TOKEN`, e.g. from `gcloud auth print-access-token`) works in place of a key.
+
+## Engines
+
+Both runtimes share the same code. Postgres uses `pg` and MySQL uses `mysql2`; both run on Workers with `nodejs_compat`. BigQuery talks to the REST API with a service-account JWT signed by WebCrypto (no Google SDK).
+
+<!-- source: BigQuery cells name the vars the shorthand connection reads (packages/core/src/config.ts); the other cells are unchanged. -->
+| | Postgres | MySQL 8 (MariaDB: best effort, untested) | BigQuery |
+|--|--|--|--|
+| Node / Docker | `url` | `url` | `BIGQUERY_*` vars |
+| Workers | Hyperdrive or `url` | Hyperdrive or `url` | `BIGQUERY_*` secrets |
+| Read-only enforced by the engine | `BEGIN READ ONLY` | `START TRANSACTION READ ONLY` | dry-run `statementType` |
+| `dry_run` writes | transaction + rollback | transaction + rollback (not DDL) | dry-run job (bytes, no row count) |
+
+## Tools
+
+| Tool | What it does |
+|------|--------------|
+| `connections_list` | Configured connections: engine, access level, policy, default |
+| `connection_info` | Ping + server version, database/project, current user, read-only state |
+| `schemas_list` | Schemas (Postgres), databases (MySQL), datasets (BigQuery) |
+| `tables_list` | Tables and views (kind, estimated rows, size), filter by name |
+| `table_describe` | Columns, types, nullability, defaults, comments, PK/FK, indexes, referencing tables, partitioning/clustering, view SQL |
+| `table_sample` | First N rows, visible columns only (BigQuery uses `tabledata.list`, which bills nothing) |
+| `columns_search` | Find columns by name across tables |
+| `sql_query` | One **read-only** statement. Always read-only, whatever the connection allows |
+| `sql_explain` | Plan without executing (Postgres/MySQL `EXPLAIN FORMAT JSON`); BigQuery dry run (bytes, statement type) |
+| `sql_execute` | Writes, up to the connection's access level; `dry_run: true` previews and rolls back. **Only registered when some connection is not read-only** |
+
+Bind parameters: Postgres `$1, $2…` from `params: [...]`; MySQL `?` from `params: [...]`; BigQuery `?` from `params: [...]` or `@name` from `params: {...}` (a value can be `{"type": "DATE", "value": "2024-01-01"}`).
+
+## Access levels
+
+Set `DB_ACCESS` for every connection, and override it per connection with `"access"` in `DB_CONNECTIONS_JSON` (or `DATABASE_ACCESS` / `MYSQL_ACCESS` / `BIGQUERY_ACCESS`).
+
+| Access | Allows |
+|--------|--------|
+| `read_only` (default) | `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `EXPLAIN`, `DESCRIBE` |
+| `read_write` | + `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `REPLACE` (one statement per call, in a transaction) |
+| `admin` | + DDL, `GRANT`, `VACUUM`, `CALL`; on Postgres also multi-statement scripts |
+
+Each statement is checked twice:
+
+1. **SQL classifier** (all engines). Comments, strings and dollar quotes are stripped; MySQL `/*! … */` executable comments are read as code. A call holds one statement (Postgres `admin` excepted). Data-modifying CTEs, `SELECT … INTO`, `EXPLAIN ANALYZE <write>` and side-effect functions are refused when access is too low (`pg_terminate_backend`, `set_config`, `dblink`, `LOAD_FILE`, `GET_LOCK`…).
+2. **Engine enforcement**
+   - **Postgres**: reads run in `BEGIN TRANSACTION READ ONLY` with `SET LOCAL statement_timeout`, through the extended protocol, which accepts one statement only. Rows stream through a cursor.
+   - **MySQL**: reads run in `START TRANSACTION READ ONLY`. `sql_select_limit` caps the rows the server sends, and `max_execution_time` (MariaDB: `max_statement_time`) caps the time. `multipleStatements` is always off. MySQL DDL commits implicitly, so the classifier is what keeps DDL out.
+   - **BigQuery**: every statement is dry-run first (free). Its `statementType` must fit the access level. `max_bytes_billed` caps cost.
+
+For defense in depth, also use a **read-only database user** for read-only connections. For BigQuery, give the service account only `roles/bigquery.dataViewer` + `roles/bigquery.jobUser`.
+
+## Guardrails: schema allowlist and hidden columns
+
+Per connection: `"schemas": ["public", "shop"]` and `"hidden_columns": ["password", "users.ssn", "*token*"]`. Shorthand env vars: `DATABASE_SCHEMAS`, `MYSQL_SCHEMAS`, `BIGQUERY_DATASETS`, `*_HIDDEN_COLUMNS`. `DB_HIDDEN_COLUMNS` applies to every connection.
+
+- **Metadata**: other schemas and hidden columns disappear from `schemas_list`, `tables_list`, `table_describe` and `columns_search`. `table_sample` selects only visible columns.
+- **SQL**: any identifier matching a hidden pattern is refused. Then the engine checks what the statement really touches:
+  - Postgres: `search_path` is pinned to the allowlist. `EXPLAIN (VERBOSE)` is inspected for every scanned relation and the columns read from it, which catches `SELECT *`, aliases and `row_to_json(t)`.
+  - MySQL: schema-qualified names are checked against the server's schema list, and each result column's origin (`db`, `orgTable`, `orgName`) is checked before commit.
+  - BigQuery: the dry run's referenced tables and output schema are checked.
+- Admin statements are disabled on a connection that has a policy.
+
+> [!IMPORTANT]
+> Not a security boundary for SQL hidden inside functions or procedures: use database grants (column privileges, views) for hard guarantees.
+
+## Response budget
+
+`DB_MAX_ROWS` (default 200) caps rows. `DB_MAX_RESULT_BYTES` (default 100 000) caps the JSON size, and rows past it are dropped (`truncated_by: "bytes"`). `DB_MAX_CELL_CHARS` (default 2 000) cuts long strings and JSON cells. All three keep agents from flooding their context.
+
+## Audit log
+
+`DB_AUDIT_LOG=meta` (default) writes one JSON line per tool call. Each line has principal (`stdio`, `bearer`, `github:<login>`, `password`), tool, connection, statement class, command, rows, affected rows, dry-run flag, duration, error and `sql_sha256`. Use `sql` to include the SQL text, `off` to disable. Node writes to **stderr** (stdout carries stdio MCP). Workers write to Workers Logs (`[observability] enabled = true`).
 
 ## Layout
 
@@ -298,6 +300,10 @@ TEST_MYSQL_URL=mysql://root:root@localhost:3306/shop pnpm test          # + live
 
 node scripts/oauth-smoke.mjs http://localhost:8787 "$OAUTH_PASSWORD" write   # Worker in AUTH_MODE=oauth
 ```
+
+<!-- source: CONTRIBUTING.md -->
+> [!CAUTION]
+> The live tests run only when `TEST_DATABASE_URL` / `TEST_MYSQL_URL` are set, and they create, update and delete fixture data. Use isolated instances and never point them at a production database.
 
 ## License
 
