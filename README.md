@@ -1,6 +1,15 @@
 # db-mcp
 
+[![CI](https://github.com/L92-Labs/db-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/L92-Labs/db-mcp/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/L92-Labs/db-mcp)](https://github.com/L92-Labs/db-mcp/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+<!-- source: badges only for what the repo has. CI = .github/workflows/ci.yml; release = the GitHub release of tag v0.1.0; license = LICENSE -->
 Database **MCP** server for L92 Labs: **Postgres**, **MySQL** and **BigQuery**. One tool surface, two runtimes:
+
+<!-- source: the setup links point at the install sections. Entry, Auth and Good for are the previous table, moved up so it follows "two runtimes:". -->
+| Runtime | Entry | Auth | Good for |
+|---------|-------|------|----------|
+| **Node**: [published image](#quick-start-published-image), [stdio](#node--stdio-claude-desktop-cursor-claude-code), [Docker (HTTP)](#docker-http) | stdio or Streamable HTTP | bearer token | Local MCP clients, Docker on any host |
+| **Cloudflare Worker**: [Workers + Hyperdrive](#cloudflare-workers--hyperdrive) | `POST /mcp` | bearer token or **OAuth 2.1** | Hosted remote MCP (claude.ai, ChatGPT, Cursor…), Postgres/MySQL through **Hyperdrive** |
 
 Start here: [published Docker image](#quick-start-published-image),
 [releases and manual publishing](docs/releases.md),
@@ -11,7 +20,10 @@ Start here: [published Docker image](#quick-start-published-image),
 Requires Docker Compose v2. Images become available after the first successful
 publish; anonymous pulls require the GHCR package to be public.
 
+<!-- source: clone and cd added. .env.example and docker-compose.image.yml are tracked files, so the next commands need a checkout. -->
 ```bash
+git clone https://github.com/L92-Labs/db-mcp.git
+cd db-mcp
 cp .env.example .env
 # Edit .env: real DB connection + strong MCP_BEARER_TOKEN; keep DB_ACCESS=read_only.
 # Generate a bearer token: openssl rand -hex 32
@@ -21,10 +33,12 @@ curl --fail http://127.0.0.1:8787/health
 ```
 
 Connect a Streamable HTTP MCP client to `http://127.0.0.1:8787/mcp` with
-`Authorization: Bearer <your-token>`. The database host must be reachable from
-inside the container; `localhost` in a DB URL refers to the container itself.
-`/health` checks server/config availability, not database access; call
-`connection_info` to verify the connection.
+`Authorization: Bearer <your-token>`. `/health` checks server/config
+availability, not database access; call `connection_info` to verify the
+connection.
+
+> [!NOTE]
+> The database host must be reachable from inside the container; `localhost` in a DB URL refers to the container itself.
 
 Set `DB_MCP_IMAGE=ghcr.io/l92-labs/db-mcp:0.1.0` in `.env` to select a release,
 or use `ghcr.io/l92-labs/db-mcp@sha256:<digest>` for a pinned image. Available
@@ -48,17 +62,15 @@ To roll back, set the previous version/digest and repeat those commands.
 Inspect status/logs with `docker compose -f docker-compose.image.yml ps` and
 `docker compose -f docker-compose.image.yml logs --tail=100 db-mcp`.
 
-| Runtime | Entry | Auth | Good for |
-|---------|-------|------|----------|
-| **Node** | stdio or Streamable HTTP | bearer token | Local MCP clients, Docker on any host |
-| **Cloudflare Worker** | `POST /mcp` | bearer token or **OAuth 2.1** | Hosted remote MCP (claude.ai, ChatGPT, Cursor…), Postgres/MySQL through **Hyperdrive** |
+## Engines
 
 Both runtimes share the same code. Postgres uses `pg` and MySQL uses `mysql2`; both run on Workers with `nodejs_compat`. BigQuery talks to the REST API with a service-account JWT signed by WebCrypto (no Google SDK).
 
+<!-- source: BigQuery cells name the vars the shorthand connection reads (packages/core/src/config.ts); the other cells are unchanged. -->
 | | Postgres | MySQL 8 (MariaDB: best effort, untested) | BigQuery |
 |--|--|--|--|
-| Node / Docker | ✅ `url` | ✅ `url` | ✅ |
-| Workers | ✅ Hyperdrive or `url` | ✅ Hyperdrive or `url` | ✅ |
+| Node / Docker | `url` | `url` | `BIGQUERY_*` vars |
+| Workers | Hyperdrive or `url` | Hyperdrive or `url` | `BIGQUERY_*` secrets |
 | Read-only enforced by the engine | `BEGIN READ ONLY` | `START TRANSACTION READ ONLY` | dry-run `statementType` |
 | `dry_run` writes | transaction + rollback | transaction + rollback (not DDL) | dry-run job (bytes, no row count) |
 
