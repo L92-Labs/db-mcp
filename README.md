@@ -155,20 +155,51 @@ DB_DEFAULT_CONNECTION=app
 
 A connection with both `url` and `hyperdrive` works everywhere: Workers use the Hyperdrive binding, Node/Docker use the url.
 
-| Var | Default | |
-|-----|---------|--|
-| `DB_ACCESS` | `read_only` | default access level (`read_only`, `read_write`, `admin`; aliases `ro`, `rw`) |
-| `DB_MAX_ROWS` / `DB_MAX_RESULT_BYTES` / `DB_MAX_CELL_CHARS` | `200` / `100000` / `2000` | response budget |
-| `DB_STATEMENT_TIMEOUT_MS` | `30000` | per-statement timeout |
-| `DB_AUDIT_LOG` | `meta` | `off`, `meta`, `sql` |
-| `DB_HIDDEN_COLUMNS` | — | hidden column globs for every connection |
-| `MCP_BEARER_TOKEN` | — | required for HTTP / Docker; on Workers always accepted |
-| `DB_POOL_MAX` | `5` | Node: pool size per connection |
+All settings, in one table. Where: `all` = every runtime, `Node` = Node and the Docker image, `Compose` = `docker-compose.image.yml`, `Workers` = the Worker only.
+
+<!-- source: names and defaults from packages/core/src/config.ts; Node rows from apps/node/src/index.ts, apps/node/src/adapters.ts and the dotenv default path; Compose rows from docker-compose.image.yml; Worker rows from apps/worker/wrangler.toml, apps/worker/src/env.ts, apps/worker/src/index.ts and apps/worker/src/oauth.ts. -->
+| Var | Default | Where | What it controls |
+|-----|---------|-------|------------------|
+| `MCP_BEARER_TOKEN` | none | all | Required for HTTP / Docker; on Workers always accepted |
+| `DB_ACCESS` | `read_only` | all | Default access level (`read_only`, `read_write`, `admin`; aliases `ro`, `rw`) |
+| `DB_MAX_ROWS` / `DB_MAX_RESULT_BYTES` / `DB_MAX_CELL_CHARS` | `200` / `100000` / `2000` | all | Response budget |
+| `DB_STATEMENT_TIMEOUT_MS` | `30000` | all | Per-statement timeout |
+| `DB_AUDIT_LOG` | `meta` | all | `off`, `meta`, `sql` |
+| `DB_HIDDEN_COLUMNS` | none | all | Hidden column globs for every connection |
+| `DB_CONNECTIONS_JSON` | none | all | Several named connections; replaces the single-connection vars below |
+| `DB_DEFAULT_CONNECTION` | first connection defined | all | Connection used when a tool call names none |
+| `DATABASE_URL` / `MYSQL_URL` / `BIGQUERY_PROJECT_ID` | none | all | One connection each for Postgres, MySQL and BigQuery, named `postgres`, `mysql`, `bigquery` |
+| `DATABASE_SSL` / `MYSQL_SSL` | none | all | TLS for that connection: `require`, `no-verify`, `disable` |
+| `DATABASE_ACCESS` / `MYSQL_ACCESS` / `BIGQUERY_ACCESS` | `DB_ACCESS` | all | Access level for that one connection |
+| `DATABASE_SCHEMAS` / `MYSQL_SCHEMAS` / `BIGQUERY_DATASETS` | none | all | Schema or dataset allowlist for that one connection |
+| `DATABASE_HIDDEN_COLUMNS` / `MYSQL_HIDDEN_COLUMNS` / `BIGQUERY_HIDDEN_COLUMNS` | none | all | Hidden columns for that one connection |
+| `BIGQUERY_CREDENTIALS_JSON` / `BIGQUERY_ACCESS_TOKEN` | none | all | Service-account key (raw JSON or base64), or an access token for local tests |
+| `BIGQUERY_LOCATION` / `BIGQUERY_DEFAULT_DATASET` / `BIGQUERY_MAX_BYTES_BILLED` | none | all | See [BigQuery setup](#bigquery-setup) |
+| `MYSQL_HYPERDRIVE` | none | Workers | Hyperdrive binding for the `mysql` connection |
+| `MCP_TRANSPORT` | `stdio` | Node | `stdio` or `http`; the Docker image sets `http` |
+| `PORT` | `8787` | Node | HTTP listen port |
+| `DB_ENV_FILE` | `.env` in the working directory | Node | Path of the env file to load |
+| `DB_POOL_MAX` | `5` | Node | Pool size per connection |
+| `DB_MCP_IMAGE` | `ghcr.io/l92-labs/db-mcp:latest` | Compose | Image to pull: a tag, or `@sha256:<digest>` |
+| `TUNNEL_TOKEN` | none | Compose | Cloudflare Tunnel token for `--profile tunnel` |
+| `AUTH_MODE` | `bearer` | Workers | `bearer` or `oauth` |
+| `OAUTH_LOGIN` | `password` (`github` when `GITHUB_CLIENT_ID` is set) | Workers | Sign-in method for OAuth: `github` or `password` |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | none | Workers | GitHub OAuth app used for sign-in |
+| `OAUTH_ALLOWED_USERS` | none | Workers | Comma-separated GitHub logins allowed to sign in |
+| `OAUTH_PASSWORD` | none | Workers | Sign-in password for `OAUTH_LOGIN=password`, 16+ chars |
+| `HYPERDRIVE` (binding) | none | Workers | Postgres binding; becomes connection `postgres` when `DATABASE_URL` and `DB_CONNECTIONS_JSON` are unset |
+| `HYPERDRIVE_MYSQL` (binding) | none | Workers | Optional MySQL binding, used through `MYSQL_HYPERDRIVE` or `"hyperdrive"` in `DB_CONNECTIONS_JSON` |
+| `OAUTH_KV` (binding) | none | Workers | KV namespace; required when `AUTH_MODE=oauth` |
 
 ## Node / stdio (Claude Desktop, Cursor, Claude Code)
 
+<!-- source: CONTRIBUTING.md ("Use Node 22 and the pnpm version pinned in package.json") -->
+Needs Node 22 and the pnpm version pinned in `package.json` ([CONTRIBUTING.md](CONTRIBUTING.md)).
+
+<!-- source: commands from CONTRIBUTING.md -->
 ```bash
-pnpm install
+corepack enable
+pnpm install --frozen-lockfile
 pnpm build
 ```
 
