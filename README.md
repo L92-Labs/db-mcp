@@ -267,7 +267,7 @@ Environment settings. Where: `all` = every runtime, `Node` = Node and the Docker
 | `DATABASE_HIDDEN_COLUMNS` / `MYSQL_HIDDEN_COLUMNS` / `BIGQUERY_HIDDEN_COLUMNS` | none | all | Hidden columns for that one connection |
 | `BIGQUERY_CREDENTIALS_JSON` / `BIGQUERY_ACCESS_TOKEN` | none | all | Service-account key (raw JSON or base64), or an access token for local tests |
 | `BIGQUERY_LOCATION` / `BIGQUERY_DEFAULT_DATASET` / `BIGQUERY_MAX_BYTES_BILLED` | none | all | See [BigQuery setup](#bigquery-setup) |
-| `DATABASE_HYPERDRIVE` | none | Workers | Binding name for shorthand `postgres`. `DATABASE_URL` takes precedence. When unset, an actual `HYPERDRIVE` binding overrides this name <!-- source: apps/worker/src/env.ts:29-34; packages/core/src/config.ts:184-192 --> |
+| `DATABASE_HYPERDRIVE` | none | Workers | Binding name for shorthand `postgres`. `DATABASE_URL` takes precedence. When `DATABASE_URL` is unset, an actual `HYPERDRIVE` binding overrides this name <!-- source: apps/worker/src/env.ts:29-34; packages/core/src/config.ts:184-192 --> |
 | `MYSQL_HYPERDRIVE` | none | Workers | Binding name for shorthand `mysql`. `MYSQL_URL` takes precedence <!-- source: packages/core/src/config.ts:201-209 --> |
 | `MCP_TRANSPORT` | `stdio` | Node | `stdio` or `http` (alias `streamable-http`); the Docker image sets `http` <!-- source: apps/node/src/index.ts:21; source: Dockerfile:17 --> |
 | `PORT` | `8787` | Node | HTTP listen port |
@@ -363,8 +363,8 @@ Per connection: `"schemas": ["public", "shop"]` and `"hidden_columns": ["passwor
 
 ## Audit log
 
-<!-- source: packages/core/src/audit.ts:75-107 -->
-`DB_AUDIT_LOG=meta` (default) writes one JSON line per tool call. Each line includes principal (`stdio`, `bearer`, `github:<login>`, `password`), tool, success status and duration. Connection and result fields such as statement class, command, rows, affected rows and the dry-run flag appear when available. Failed calls include an error. Calls with SQL text include `sql_sha256`. Use `sql` to include the SQL text, `off` to disable. Node writes to **stderr** (stdout carries stdio MCP). Workers write to Workers Logs (`[observability] enabled = true`).
+<!-- source: packages/core/src/audit.ts:75-107; packages/core/src/server.ts:82-90 (the audit call sits inside the tool handler, which runs after the SDK validates the input) -->
+`DB_AUDIT_LOG=meta` (default) writes one JSON line per tool call that reaches the registered handler. A call rejected earlier by the SDK's input validation returns an error to the client and writes no audit line. Each line includes principal (`stdio`, `bearer`, `github:<login>`, `password`), tool, success status and duration. Connection and result fields such as statement class, command, rows, affected rows and the dry-run flag appear when available. Failed calls that are logged include an error. Calls with SQL text include `sql_sha256`. Use `sql` to include the SQL text, `off` to disable. Node writes to **stderr** (stdout carries stdio MCP). Workers write to Workers Logs (`[observability] enabled = true`).
 
 ## Layout
 
