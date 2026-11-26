@@ -20,7 +20,7 @@ Start here: [published Docker image](#quick-start-published-image),
 Requires Docker Compose v2. Images become available after the first successful
 publish; anonymous pulls require the GHCR package to be public.
 
-<!-- source: clone and cd added. .env.example and docker-compose.image.yml are tracked files, so the next commands need a checkout. -->
+<!-- source: .env.example; docker-compose.image.yml; .github/workflows/ci.yml:71-78 (bounded health polling) -->
 ```bash
 git clone https://github.com/L92-Labs/db-mcp.git
 cd db-mcp
@@ -29,7 +29,16 @@ cp .env.example .env
 # Generate a bearer token: openssl rand -hex 32
 docker compose -f docker-compose.image.yml pull
 docker compose -f docker-compose.image.yml up -d
-curl --fail http://127.0.0.1:8787/health
+(
+  for attempt in {1..30}; do
+    if curl --fail --silent --max-time 1 http://127.0.0.1:8787/health; then
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "db-mcp health check timed out" >&2
+  exit 1
+)
 ```
 
 Connect a Streamable HTTP MCP client to `http://127.0.0.1:8787/mcp` with
@@ -72,7 +81,14 @@ Needs Node 22 and the pnpm version pinned in `package.json` ([CONTRIBUTING.md](C
 corepack enable
 pnpm install --frozen-lockfile
 pnpm build
+cp .env.example .env
 ```
+
+<!-- source: apps/node/src/index.ts:8-12; packages/core/src/config.ts:243-247; .env.example:36-59 -->
+Before launching the client, edit `.env` in the repository root. Configure a
+reachable Postgres or MySQL URL, [BigQuery](#bigquery-setup), or
+`DB_CONNECTIONS_JSON`. Remove or comment out unused sample URLs. Use the
+absolute checkout paths in the client configuration below.
 
 ```json
 {
@@ -88,13 +104,14 @@ pnpm build
 
 ## Docker (HTTP)
 
-<!-- source: docker-compose.yml:2; source: apps/node/src/server.ts:56; source: scripts/smoke.mjs:4; source: package.json:8; source: package.json:18; source: CONTRIBUTING.md:3 -->
+<!-- source: docker-compose.yml:2; source: apps/node/src/server.ts:56; source: .env.example:36-50; source: packages/core/src/config.ts:258-259; source: scripts/smoke.mjs:7,25-37; source: package.json:8; source: package.json:18; source: CONTRIBUTING.md:3 -->
 From the repository root, use Docker Compose v2, Node 22 and the pnpm version
 pinned in `package.json`. Edit `.env` as indicated before starting Compose.
 
 ```bash
 cp .env.example .env
-# Edit .env: set DATABASE_URL, MYSQL_URL or BigQuery settings, plus MCP_BEARER_TOKEN.
+# Edit .env and set MCP_BEARER_TOKEN plus DATABASE_URL, MYSQL_URL or BigQuery settings.
+# Remove or comment out unused sample URLs. Unnamed smoke calls use the default connection.
 docker compose up --build -d
 curl --fail --retry 10 --retry-connrefused http://127.0.0.1:8787/health
 corepack pnpm install --frozen-lockfile
@@ -128,12 +145,16 @@ For `AUTH_MODE=bearer`, remove the entire `[[kv_namespaces]]` entry for
 `AUTH_MODE=oauth`, run `npx wrangler kv namespace create OAUTH_KV` from
 `apps/worker` and replace the placeholder ID in that entry with the namespace ID.
 
+<!-- source: apps/worker/wrangler.toml:11-25,33-43; packages/core/src/config.ts:201-209 -->
+Run `pnpm install` at the repository root, then `cd apps/worker`. Choose a
+database setup before deploying:
+
+- **Postgres**. Run `npx wrangler hyperdrive create db-mcp-main --connection-string="postgres://user:pw@host:5432/db"` with your connection string. Set the returned ID on the `HYPERDRIVE` entry in `wrangler.toml`.
+- **MySQL only**. Run `npx wrangler hyperdrive create db-mcp-mysql --connection-string="mysql://user:pw@host:3306/db"` with your connection string. Uncomment the MySQL `[[hyperdrive]]` entry in `wrangler.toml`, set its ID to the returned ID, remove the entire Postgres `HYPERDRIVE` entry, and add `MYSQL_HYPERDRIVE = "HYPERDRIVE_MYSQL"` under `[vars]`. Leave `MYSQL_URL` unset to use the binding.
+
+For bearer mode, run:
+
 ```bash
-pnpm install
-cd apps/worker
-npx wrangler hyperdrive create db-mcp-main --connection-string="postgres://user:pw@host:5432/db"
-# put the id in wrangler.toml ([[hyperdrive]] binding = "HYPERDRIVE"); MySQL: uncomment HYPERDRIVE_MYSQL
-cp .dev.vars.example .dev.vars
 npx wrangler secret put MCP_BEARER_TOKEN
 pnpm deploy
 ```
@@ -148,12 +169,21 @@ The Worker opens one database client per operation; Hyperdrive does the pooling.
 
 ### OAuth (claude.ai and other remote MCP clients)
 
-Set `AUTH_MODE=oauth`. The Worker becomes an OAuth 2.1 authorization server (via `@cloudflare/workers-oauth-provider`):
+<!-- source: apps/worker/wrangler.toml:27-46; apps/worker/src/index.ts:95-98; apps/worker/src/oauth.ts:113-129; apps/worker/package.json:8; https://developers.cloudflare.com/workers/configuration/secrets/; https://developers.cloudflare.com/workers/wrangler/commands/workers/ -->
+Before deploying OAuth, restore the `OAUTH_KV` entry if you removed it and
+configure its namespace ID as above. In `apps/worker/wrangler.toml`, set
+`AUTH_MODE = "oauth"` under `[vars]`. Put the chosen sign-in settings below
+in a private dotenv file. From `apps/worker`, deploy with
+`pnpm run deploy --secrets-file /absolute/path/to/oauth-secrets.env` to upload
+the settings as Worker secrets with the new mode. Wrangler uses `.dev.vars`
+for local development.
+
+The Worker becomes an OAuth 2.1 authorization server (via `@cloudflare/workers-oauth-provider`):
 
 - discovery (RFC 9728 / 8414), dynamic client registration and Client ID Metadata Documents
 - PKCE, a consent page and refresh tokens
 
-The static `MCP_BEARER_TOKEN` keeps working for CLI clients.
+If configured, the static `MCP_BEARER_TOKEN` keeps working for CLI clients.
 
 | Sign-in | Secrets |
 |---------|---------|
@@ -206,8 +236,8 @@ Environment settings. Where: `all` = every runtime, `Node` = Node and the Docker
 | `DATABASE_HIDDEN_COLUMNS` / `MYSQL_HIDDEN_COLUMNS` / `BIGQUERY_HIDDEN_COLUMNS` | none | all | Hidden columns for that one connection |
 | `BIGQUERY_CREDENTIALS_JSON` / `BIGQUERY_ACCESS_TOKEN` | none | all | Service-account key (raw JSON or base64), or an access token for local tests |
 | `BIGQUERY_LOCATION` / `BIGQUERY_DEFAULT_DATASET` / `BIGQUERY_MAX_BYTES_BILLED` | none | all | See [BigQuery setup](#bigquery-setup) |
-| `DATABASE_HYPERDRIVE` | none | Workers | Hyperdrive binding for the shorthand `postgres` connection when `DATABASE_URL` is unset <!-- source: packages/core/src/config.ts:185; source: apps/worker/src/adapters.ts:19 --> |
-| `MYSQL_HYPERDRIVE` | none | Workers | Hyperdrive binding for the `mysql` connection |
+| `DATABASE_HYPERDRIVE` | none | Workers | Binding name for shorthand `postgres`. `DATABASE_URL` takes precedence. When unset, an actual `HYPERDRIVE` binding overrides this name <!-- source: apps/worker/src/env.ts:29-34; packages/core/src/config.ts:184-192 --> |
+| `MYSQL_HYPERDRIVE` | none | Workers | Binding name for shorthand `mysql`. `MYSQL_URL` takes precedence <!-- source: packages/core/src/config.ts:201-209 --> |
 | `MCP_TRANSPORT` | `stdio` | Node | `stdio` or `http` (alias `streamable-http`); the Docker image sets `http` <!-- source: apps/node/src/index.ts:21; source: Dockerfile:17 --> |
 | `PORT` | `8787` | Node | HTTP listen port |
 | `DB_ENV_FILE` | `.env` in the working directory | Node | Path of the env file to load |
@@ -257,7 +287,7 @@ Both runtimes share the same code. Postgres uses `pg` and MySQL uses `mysql2`; b
 | `columns_search` | Find columns by name across tables |
 | `sql_query` | One **read-only** statement. Always read-only, whatever the connection allows |
 | `sql_explain` | Plan without executing (Postgres `EXPLAIN (FORMAT JSON)`, MySQL `EXPLAIN FORMAT=JSON`); BigQuery dry run (bytes, statement type) <!-- source: packages/core/src/postgres/adapter.ts:638; source: packages/core/src/mysql/adapter.ts:844 --> |
-| `sql_execute` | Writes, up to the connection's access level; `dry_run: true` previews and rolls back. **Only registered when some connection is not read-only** |
+| `sql_execute` | Writes up to the connection's access level. With `dry_run: true`, Postgres and MySQL preview supported writes in a transaction and roll back. BigQuery validates and estimates bytes without executing. **Only registered when some connection is not read-only** <!-- source: packages/core/src/bigquery/adapter.ts:263-292; packages/core/src/mysql/adapter.ts:805-819; Engines table above --> |
 
 Bind parameters: Postgres `$1, $2…` from `params: [...]`; MySQL `?` from `params: [...]`; BigQuery `?` from `params: [...]` or `@name` from `params: {...}` (a value can be `{"type": "DATE", "value": "2024-01-01"}`).
 
@@ -276,7 +306,7 @@ Each statement is checked twice:
 1. **SQL classifier** (all engines). Comments, strings and dollar quotes are stripped; MySQL `/*! … */` executable comments are read as code. A call holds one statement (Postgres `admin` excepted). Data-modifying CTEs, `SELECT … INTO`, `EXPLAIN ANALYZE <write>` and side-effect functions are refused when access is too low (`pg_terminate_backend`, `set_config`, `dblink`, `LOAD_FILE`, `GET_LOCK`…).
 2. **Engine enforcement**
    - **Postgres**: reads run in `BEGIN TRANSACTION READ ONLY` with `SET LOCAL statement_timeout`, through the extended protocol, which accepts one statement only. Rows stream through a cursor.
-   - **MySQL**: reads run in `START TRANSACTION READ ONLY`. `sql_select_limit` caps the rows the server sends, and `max_execution_time` (MariaDB: `max_statement_time`) caps the time. `multipleStatements` is always off. MySQL DDL commits implicitly, so the classifier is what keeps DDL out.
+   - **MySQL**: reads run in `START TRANSACTION READ ONLY`. `sql_select_limit` sets the default server row limit. An explicit `LIMIT` can override it, and the adapter caps streamed rows separately. MySQL `max_execution_time` applies to `SELECT` only. MariaDB uses `max_statement_time`. <!-- source: packages/core/src/mysql/adapter.ts:125-140,165-177 --> `multipleStatements` is always off. MySQL DDL commits implicitly, so the classifier is what keeps DDL out.
    - **BigQuery**: every statement is dry-run first (free). Its `statementType` must fit the access level. `max_bytes_billed` caps cost.
 
 For defense in depth, also use a **read-only database user** for read-only connections. For BigQuery, give the service account only `roles/bigquery.dataViewer` + `roles/bigquery.jobUser`.
@@ -305,37 +335,77 @@ Per connection: `"schemas": ["public", "shop"]` and `"hidden_columns": ["passwor
 
 ## Layout
 
+<!-- source: Dockerfile:1-23 (repository root) -->
 ```
 packages/core   config, access levels, SQL classifier, policy, audit, tool schemas, dispatch, MCP server,
                 postgres/ (pg + pg-cursor), mysql/ (mysql2), bigquery/ (REST + WebCrypto JWT)
-apps/node       stdio + Streamable HTTP, pools per connection, Dockerfile
+apps/node       stdio + Streamable HTTP, pools per connection
 apps/worker     /mcp on Workers, Hyperdrive bindings, OAuth 2.1 (GitHub / password sign-in)
+Dockerfile      Node container image
 examples/       seed.sql (Postgres) and seed.mysql.sql demo schemas
 scripts/        smoke.mjs (bearer) and oauth-smoke.mjs (full OAuth flow) end-to-end checks
 ```
 
 ## Tests
 
+<!-- source: .github/workflows/ci.yml:20-56; test/postgres.integration.test.ts:44-60; test/mysql.integration.test.ts:47-57 -->
 ```bash
 pnpm test        # unit: classifier, config, policy, budget, audit, dispatch, MCP, BigQuery (mocked)
 
-docker run -d --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres \
-  -v $PWD/examples/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro postgres:17-alpine
-docker run -d --rm -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=shop \
-  -v $PWD/examples/seed.mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro mysql:8.4
-TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-TEST_MYSQL_URL=mysql://root:root@localhost:3306/shop pnpm test          # + live Postgres and MySQL
+# Run from the repository root in Bash.
+(
+  set -e
+  pg=
+  mysql=
+  trap 'docker stop ${pg:+"$pg"} ${mysql:+"$mysql"} >/dev/null 2>&1 || true' EXIT
+  pg=$(docker run -d --rm -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=postgres postgres:17-alpine)
+  mysql=$(docker run -d --rm -p 127.0.0.1:3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=shop mysql:8.4)
+
+  wait_for_db() {
+    for attempt in {1..30}; do
+      if "$@" >/dev/null 2>&1; then return 0; fi
+      sleep 1
+    done
+    echo "Database readiness timed out" >&2
+    return 1
+  }
+
+  wait_for_db docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres
+  wait_for_db docker exec "$mysql" mysql -h 127.0.0.1 -uroot -proot -e 'SELECT 1'
+  docker exec -i "$pg" psql -U postgres -d postgres -v ON_ERROR_STOP=1 < examples/seed.sql
+  docker exec -i "$mysql" mysql -uroot -proot < examples/seed.mysql.sql
+
+  TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+  TEST_MYSQL_URL=mysql://root:root@127.0.0.1:3306/shop pnpm test
+)
 ```
 
-<!-- source: scripts/oauth-smoke.mjs:2; source: scripts/oauth-smoke.mjs:74; source: apps/worker/src/oauth.ts:114 -->
-For the OAuth smoke test, start a local Worker with `AUTH_MODE=oauth` and
-`OAUTH_LOGIN=password`. From the repository root, enter that Worker's
-`OAUTH_PASSWORD` at the Bash prompt. The script uses password consent.
+<!-- source: scripts/oauth-smoke.mjs:2-7,42-43,118-125; apps/worker/src/oauth.ts:113-127; apps/worker/src/index.ts:35-38,95-98; apps/worker/.dev.vars.example:2-6; apps/worker/wrangler.toml:15-18,27-35; apps/worker/package.json:7; https://developers.cloudflare.com/kv/concepts/kv-bindings/ -->
+For the OAuth smoke test, use Node 22 and install dependencies with `pnpm install`
+at the repository root.
+
+1. Keep or restore the `[[kv_namespaces]]` entry with `binding = "OAUTH_KV"` in
+   `apps/worker/wrangler.toml`. Wrangler simulates the namespace locally.
+   Start an isolated database and configure a reachable default connection
+   using the local Hyperdrive settings above. For the sample Postgres binding,
+   use a running local Postgres database at its `localConnectionString`.
+2. Copy `apps/worker/.dev.vars.example` to `apps/worker/.dev.vars` if needed.
+   In that file, set `AUTH_MODE=oauth`, `OAUTH_LOGIN=password` and
+   `OAUTH_PASSWORD` to a value of at least 16 characters. Use `DB_ACCESS=read_only`
+   for the read test below.
+3. Run `pnpm dev` from `apps/worker`. Once Wrangler listens on port 8787, open
+   a second Bash shell at the repository root and enter the same password at
+   the prompt.
 
 ```bash
 read -r -s -p 'Worker OAuth password: ' OAUTH_PASSWORD
-node scripts/oauth-smoke.mjs http://localhost:8787 "$OAUTH_PASSWORD" write
+node scripts/oauth-smoke.mjs http://localhost:8787 "$OAUTH_PASSWORD" read
 ```
+
+<!-- source: scripts/oauth-smoke.mjs:42-43,118-125; packages/core/src/dispatch.ts:39-43; packages/core/src/tools.ts:81 -->
+To check write scope, configure at least one `read_write` or `admin` connection,
+restart the Worker, and pass `write` as the final argument. Check the script's
+`PASS` and `FAIL` lines for the result.
 
 <!-- source: CONTRIBUTING.md -->
 > [!CAUTION]
